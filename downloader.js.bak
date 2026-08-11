@@ -1,0 +1,443 @@
+const puppeteer = require('puppeteer');
+const fs = require('fs');
+const path = require('path');
+const { URL } = require('url');
+const cheerio = require('cheerio');
+const readline = require('readline/promises');
+const { stdin: input, stdout: output } = require('process');
+
+const MIME_TO_EXTENSION = {
+    'image/jpeg': '.jpg',
+    'image/jpg': '.jpg',
+    'image/png': '.png',
+    'image/webp': '.webp',
+    'image/avif': '.avif',
+    'image/gif': '.gif',
+    'image/svg+xml': '.svg',
+    'image/x-icon': '.ico',
+    'image/vnd.microsoft.icon': '.ico',
+    'text/css': '.css',
+    'application/javascript': '.js',
+    'text/javascript': '.js'
+};
+
+let TARGET_URL = ''; 
+let OUTPUT_DIR = '';
+
+// Default fallback options (overwritten by config.json)
+let FLATTEN_ASSETS = false;
+let REMOVE_ALL_SCRIPTS = false;
+let REMOVE_ALL_IFRAMES = false; 
+
+let excludedPatterns = [];
+let ignoredPatterns = [];
+
+const flatPathRegistry = new Map();
+const filenameCounter = new Map();
+
+function getDomain(url) {
+    try {
+        const parsed = new URL(url.startsWith('http') ? url : 'https:' + url);
+        let domain = parsed.hostname;
+        if (domain.startsWith('www.')) domain = domain.substring(4);
+        return domain;
+    } catch (e) {
+        let domain = url.replace(/^https?:\/\//, '');
+        return domain.split('/')[0].replace(/^www\./, '');
+    }
+}
+
+function wildcardToRegex(wildcardStr) {
+    let escaped = wildcardStr.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    escaped = escaped.replace(/\*/g, '.*').replace(/\?/g, '.');
+    return new RegExp('^' + escaped + '$', 'i');
+}
+
+function getFlatRelativePath(requestUrl, contentType = '') {
+    if (flatPathRegistry.has(requestUrl)) {
+        return flatPathRegistry.get(requestUrl);
+    }
+
+    try {
+        const parsedUrl = new URL(requestUrl);
+        let pathname = parsedUrl.pathname.split('?')[0];
+
+        let subDir = 'assets';
+        const mime = contentType.toLowerCase();
+        if (mime.startsWith('image/')) subDir = 'images';
+        else if (mime.includes('css') || pathname.endsWith('.css')) subDir = 'css';
+        else if (mime.includes('javascript') || pathname.endsWith('.js')) subDir = 'js';
+        else if (pathname.endsWith('.html') || pathname.endsWith('.htm')) subDir = 'html';
+
+        let baseName = path.basename(pathname);
+        if (!baseName || baseName === '/' || pathname.endsWith('/')) {
+            baseName = 'index';
+        }
+
+        let ext = path.extname(baseName);
+        if (!ext && contentType) {
+            ext = MIME_TO_EXTENSION[mime] || '';
+            baseName += ext;
+        }
+
+        const nameWithoutExt = path.basename(baseName, ext);
+        let finalBaseName = baseName;
+
+        const lowercaseKey = `${subDir}/${finalBaseName}`.toLowerCase();
+        if (filenameCounter.has(lowercaseKey)) {
+            const count = filenameCounter.get(lowercaseKey) + 1;
+            filenameCounter.set(lowercaseKey, count);
+            finalBaseName = `${nameWithoutExt}_${count}${ext}`;
+        } else {
+            filenameCounter.set(lowercaseKey, 1);
+        }
+
+        const relativePath = `${subDir}/${finalBaseName}`;
+        flatPathRegistry.set(requestUrl, relativePath);
+        return relativePath;
+    } catch (e) {
+        return 'assets/unknown_asset';
+    }
+}
+
+function urlToLocalPath(requestUrl, contentType = '') {
+    try {
+        if (requestUrl.startsWith('//')) {
+            requestUrl = 'https:' + requestUrl;
+        }
+
+        if (FLATTEN_ASSETS) {
+            const parsedUrl = new URL(requestUrl);
+            const cleanTargetUrl = new URL(TARGET_URL);
+            if (parsedUrl.href === cleanTargetUrl.href || parsedUrl.pathname === '/' && parsedUrl.hostname === cleanTargetUrl.hostname) {
+                return path.join(OUTPUT_DIR, 'index.html');
+            }
+            
+            const rel = getFlatRelativePath(requestUrl, contentType);
+            return path.join(OUTPUT_DIR, rel);
+        }
+
+        const parsedUrl = new URL(requestUrl);
+        let hostFolder = parsedUrl.hostname;
+        if (hostFolder.startsWith('www.')) hostFolder = hostFolder.substring(4);
+
+        let pathname = parsedUrl.pathname.split('?')[0];
+        if (pathname === '/' || pathname.endsWith('/')) pathname += 'index.html';
+
+        const isImageMime = contentType && contentType.startsWith('image/');
+        const hasExtension = path.extname(pathname) !== '';
+
+        if (!hasExtension) {
+            if (isImageMime) {
+                const ext = MIME_TO_EXTENSION[contentType.toLowerCase()] || '.png';
+                pathname += ext;
+            } else if (!pathname.endsWith('.html')) {
+                pathname += '/index.html';
+            }
+        }
+
+        return path.join(OUTPUT_DIR, hostFolder, pathname);
+    } catch (e) {
+        return null;
+    }
+}
+
+function getRelativeAssetPathForRoot(assetUrl, contentType = '') {
+    if (assetUrl.startsWith('//')) {
+        assetUrl = 'https:' + assetUrl;
+    }
+
+    if (FLATTEN_ASSETS) {
+        return getFlatRelativePath(assetUrl, contentType);
+    }
+
+    const assetLocalPath = urlToLocalPath(assetUrl, contentType);
+    if (!assetLocalPath) return assetUrl;
+
+    let relativePath = path.relative(OUTPUT_DIR, assetLocalPath).replace(/\\/g, '/');
+    if (relativePath.startsWith('/')) relativePath = relativePath.substring(1);
+
+    try {
+        const parsedUrl = new URL(assetUrl.startsWith('http') ? assetUrl : 'https:' + assetUrl);
+        let targetDomain = parsedUrl.hostname;
+        if (targetDomain.startsWith('www.')) targetDomain = targetDomain.substring(4);
+
+        const doubleDomainPrefix = `${targetDomain}/${targetDomain}/`;
+        if (relativePath.startsWith(doubleDomainPrefix)) {
+            relativePath = relativePath.substring(targetDomain.length + 1);
+        }
+    } catch (e) {}
+
+    return relativePath;
+}
+
+async function autoScroll(page) {
+    await page.evaluate(async () => {
+        await new Promise((resolve) => {
+            let totalHeight = 0;
+            const distance = 100;
+            const timer = setInterval(() => {
+                const scrollHeight = document.body.scrollHeight;
+                window.scrollBy(0, distance);
+                totalHeight += distance;
+
+                if (totalHeight >= scrollHeight || totalHeight > 20000) {
+                    clearInterval(timer);
+                    resolve();
+                }
+            }, 50);
+        });
+    });
+}
+
+function rewriteCssUrls(cssText, baseUrl) {
+    const cssUrlRegex = /url\(['"]?([^'")]+)['"]?\)/g;
+    return cssText.replace(cssUrlRegex, (match, originalUrl) => {
+        if (originalUrl.startsWith('data:')) return match;
+        try {
+            const absoluteUrl = new URL(originalUrl, baseUrl).href;
+            if (ignoredPatterns.some(regex => regex.test(absoluteUrl))) return match;
+
+            const localRelativePath = getRelativeAssetPathForRoot(absoluteUrl);
+            return `url("${localRelativePath}")`;
+        } catch (e) {
+            return match;
+        }
+    });
+}
+
+async function mainPrompts() {
+    const rl = readline.createInterface({ input, output });
+
+    let inputUrl = await rl.question('Enter website URL: ');
+    if (!inputUrl.startsWith('http://') && !inputUrl.startsWith('https://')) {
+        inputUrl = 'https://' + inputUrl;
+    }
+    TARGET_URL = inputUrl;
+
+    const defaultFolderName = getDomain(TARGET_URL);
+    const inputFolder = await rl.question(`Enter output folder name (Default: ${defaultFolderName}): `);
+    const folderName = inputFolder.trim() || defaultFolderName;
+    OUTPUT_DIR = path.join(__dirname, 'downloaded_site', folderName);
+
+    if (fs.existsSync(OUTPUT_DIR)) {
+        const files = fs.readdirSync(OUTPUT_DIR);
+        if (files.length > 0) {
+            const cleanConfirm = await rl.question(`\nWarning: The folder "${folderName}" already contains files.\nDo you want to empty this folder first? (yes/no, Default: no): `);
+            if (cleanConfirm.toLowerCase().trim() === 'yes' || cleanConfirm.toLowerCase().trim() === 'y') {
+                console.log(`Emptying folder: ${OUTPUT_DIR}...`);
+                fs.rmSync(OUTPUT_DIR, { recursive: true, force: true });
+            }
+        }
+    }
+
+    rl.close();
+    await downloadPage();
+}
+
+async function downloadPage() {
+    // --- LOAD CONFIG FEATURES AUTOMATICALLY ---
+    const configPath = path.join(__dirname, 'config.json');
+    if (fs.existsSync(configPath)) {
+        try {
+            const configData = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+            
+            // Map configuration booleans safely
+            if (typeof configData.flattenAssets === 'boolean') FLATTEN_ASSETS = configData.flattenAssets;
+            if (typeof configData.removeAllScripts === 'boolean') REMOVE_ALL_SCRIPTS = configData.removeAllScripts;
+            if (typeof configData.removeAllIframes === 'boolean') REMOVE_ALL_IFRAMES = configData.removeAllIframes;
+
+            if (configData.excludeScripts && Array.isArray(configData.excludeScripts)) {
+                excludedPatterns = configData.excludeScripts.map(pattern => wildcardToRegex(pattern));
+            }
+            if (configData.ignoredSources && Array.isArray(configData.ignoredSources)) {
+                ignoredPatterns = configData.ignoredSources.map(pattern => wildcardToRegex(pattern));
+            }
+            
+            console.log(`[Config Loaded] Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Strip iFrames: ${REMOVE_ALL_IFRAMES}`);
+        } catch (e) {
+            console.error(`[Config Error] Could not read config.json: ${e.message}`);
+        }
+    }
+
+    const browser = await puppeteer.launch({ headless: true });
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
+
+    const urlContentTypeMap = new Map();
+    const savedCssFiles = new Set();
+
+    await page.setRequestInterception(true);
+
+    page.on('request', (request) => {
+        const url = request.url();
+        if (ignoredPatterns.some(regex => regex.test(url))) {
+            request.abort();
+            return;
+        }
+        request.continue();
+    });
+
+    page.on('response', async (response) => {
+        const url = response.url();
+        const status = response.status();
+        const headers = response.headers();
+        const contentType = headers['content-type'] || '';
+
+        if (url.startsWith('data:') || status >= 400 || status === 302) return;
+
+        urlContentTypeMap.set(url, contentType);
+
+        try {
+            const buffer = await response.buffer();
+            const localPath = urlToLocalPath(url, contentType);
+            if (!localPath) return;
+
+            fs.mkdirSync(path.dirname(localPath), { recursive: true });
+            fs.writeFileSync(localPath, buffer);
+
+            if (contentType.toLowerCase().includes('css') || url.split('?')[0].endsWith('.css')) {
+                savedCssFiles.add({ localPath, originalUrl: url });
+            }
+        } catch (err) {
+            // Stream read suppression
+        }
+    });
+
+    console.log(`\nNavigating to ${TARGET_URL}...`);
+    await page.goto(TARGET_URL, { waitUntil: 'networkidle2', timeout: 60000 });
+
+    console.log("Scrolling page layout...");
+    await autoScroll(page);
+    await new Promise(resolve => setTimeout(resolve, 2000)); 
+
+    let finalHtml = await page.content();
+    const $ = cheerio.load(finalHtml);
+
+    if ($('meta[charset]').length === 0) {
+        $('head').prepend('<meta charset="utf-8">');
+    } else {
+        $('meta[charset]').attr('charset', 'utf-8');
+    }
+
+    // --- PIPELINE 1: SCRIPT DESTRUCTION ---
+    if (REMOVE_ALL_SCRIPTS) {
+        console.log("Purging ALL script tags from target HTML...");
+        $('script').remove();
+        $('*').each((i, el) => {
+            const attribs = el.attribs;
+            for (const attr in attribs) {
+                if (attr.startsWith('on')) {
+                    $(el).removeAttr(attr);
+                }
+            }
+        });
+    } else if (excludedPatterns.length > 0) {
+        $('script').each((index, element) => {
+            const src = $(element).attr('src') || '';
+            const inlineText = $(element).text() || '';
+            if (excludedPatterns.some(regex => regex.test(src)) || excludedPatterns.some(regex => regex.test(inlineText))) {
+                $(element).remove();
+            }
+        });
+    }
+
+    // --- NEW PIPELINE: IFRAME REMOVAL ---
+    if (REMOVE_ALL_IFRAMES) {
+        console.log("Purging ALL iframe elements from target HTML...");
+        $('iframe').remove();
+    }
+
+    const resourcesToRewrite = [
+        { selector: '*[src]', attr: 'src' },
+        { selector: '*[href]', attr: 'href' }
+    ];
+
+    console.log("\n--- Running asset link processing ---");
+    for (const { selector, attr } of resourcesToRewrite) {
+        $(selector).each((index, element) => {
+            let originalUrl = $(element).attr(attr);
+            if (!originalUrl || originalUrl.startsWith('data:')) return;
+            if (element.name === 'a') return;
+            if (attr === 'href' && (originalUrl.startsWith('#') || originalUrl.startsWith('javascript:'))) return;
+
+            try {
+                const absoluteUrl = new URL(originalUrl, TARGET_URL).href;
+                if (ignoredPatterns.some(regex => regex.test(absoluteUrl))) return;
+
+                const knownContentType = urlContentTypeMap.get(absoluteUrl) || '';
+                const localRelativePath = getRelativeAssetPathForRoot(absoluteUrl, knownContentType);
+                
+                $(element).attr(attr, localRelativePath);
+            } catch (e) {}
+        });
+    }
+
+    $('style').each((index, element) => {
+        const originalCss = $(element).text();
+        const updatedCss = rewriteCssUrls(originalCss, TARGET_URL);
+        $(element).text(updatedCss);
+    });
+
+    $('[style]').each((index, element) => {
+        const originalInlineStyle = $(element).attr('style');
+        const updatedInlineStyle = rewriteCssUrls(originalInlineStyle, TARGET_URL);
+        $(element).attr('style', updatedInlineStyle);
+    });
+
+    if (savedCssFiles.size > 0) {
+        console.log(`\n--- Processing ${savedCssFiles.size} standalone CSS file(s) for asset links ---`);
+        for (const cssFile of savedCssFiles) {
+            if (fs.existsSync(cssFile.localPath)) {
+                try {
+                    const originalCssContent = fs.readFileSync(cssFile.localPath, 'utf-8');
+                    const cssUrlRegex = /url\(['"]?([^'")]+)['"]?\)/g;
+                    const updatedCssContent = originalCssContent.replace(cssUrlRegex, (match, originalUrl) => {
+                        if (originalUrl.startsWith('data:')) return match;
+                        try {
+                            const absoluteUrl = new URL(originalUrl, cssFile.originalUrl).href;
+                            if (ignoredPatterns.some(regex => regex.test(absoluteUrl))) return match;
+
+                            const localRelativePathToRoot = getRelativeAssetPathForRoot(absoluteUrl);
+                            
+                            if (FLATTEN_ASSETS) {
+                                return `url("../${localRelativePathToRoot}")`;
+                            } else {
+                                const cssDir = path.dirname(cssFile.localPath);
+                                const absoluteAssetPath = path.join(OUTPUT_DIR, localRelativePathToRoot);
+                                let relativeToCss = path.relative(cssDir, absoluteAssetPath).replace(/\\/g, '/');
+                                return `url("${relativeToCss}")`;
+                            }
+                        } catch (e) {
+                            return match;
+                        }
+                    });
+
+                    fs.writeFileSync(cssFile.localPath, updatedCssContent, 'utf-8');
+                } catch (e) {
+                    console.error(`[CSS Engine Error] Failed rewriting ${cssFile.localPath}: ${e.message}`);
+                }
+            }
+        }
+    }
+
+    const optimizedHtml = $.html({ decodeEntities: false });
+
+    console.log("\nSaving index.html layout file...");
+    const rootHtmlPath = path.join(OUTPUT_DIR, 'index.html');
+    fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+    fs.writeFileSync(rootHtmlPath, optimizedHtml, 'utf-8'); 
+
+    if (!FLATTEN_ASSETS) {
+        const targetDomainFolder = getDomain(TARGET_URL);
+        const duplicateHtmlPath = path.join(OUTPUT_DIR, targetDomainFolder, 'index.html');
+        if (fs.existsSync(duplicateHtmlPath)) {
+            try { fs.unlinkSync(duplicateHtmlPath); } catch (e) {}
+        }
+    }
+
+    await browser.close();
+    console.log(`\n============================================\nFinished! Saved output path: ${rootHtmlPath}\n============================================`);
+}
+
+mainPrompts();

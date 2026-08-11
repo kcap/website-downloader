@@ -1,0 +1,22 @@
+{
+  "evaluateHTML": false,
+  "stripSrcsets": false,
+  "flattenAssets": true,
+  "removeAllScripts": false,
+  "removeAllIframes": true,
+  "removeNoscriptTags": true,
+  "excludeScripts": [
+    "gtag.js",
+    "*tagmanager*",
+    "analytics.js",
+    "cookiebot",
+    "facebook.net",
+    "*yandex.ru*",
+    "*vk.com*"
+  ],
+  "ignoredSources": [
+    "*fonts.googleapis.com*",
+    "*fonts.gstatic.com*",
+    "*youtube.com*"
+  ]
+}
