@@ -1,10 +1,15 @@
-const puppeteer = require('puppeteer');
-const fs = require('fs');
-const path = require('path');
-const { URL } = require('url');
-const cheerio = require('cheerio');
-const readline = require('readline/promises');
-const { stdin: input, stdout: output } = require('process');
+import puppeteer from 'puppeteer';
+import fs from 'fs';
+import path from 'path';
+import { URL } from 'url';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import * as cheerio from 'cheerio';
+import readline from 'readline/promises';
+import { stdin as input, stdout as output } from 'process';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const MIME_TO_EXTENSION = {
     'image/jpeg': '.jpg',
@@ -30,10 +35,14 @@ const MIME_TO_EXTENSION = {
     'application/vnd.ms-fontobject': '.eot'
 };
 
-const VIEWPORTS = [
-    { name: 'Desktop', width: 1280, height: 800, isMobile: false },
-    { name: 'Tablet',  width: 768,  height: 1024, isMobile: true, hasTouch: true },
-    { name: 'Mobile',  width: 375,  height: 812,  isMobile: true, hasTouch: true }
+const HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9'
+}
+
+let VIEWPORTS = [
+    { name: 'Desktop', width: 1280, height: 800, isMobile: false }
 ];
 
 let TARGET_URL = ''; 
@@ -71,19 +80,6 @@ const downloadStats = {
     errors: [],
     missingFiles: new Set()
 };
-
-
-function normalizeAssetUrl(url) {
-    try {
-        if (url.startsWith('//')) url = 'https:' + url;
-        const u = new URL(url);
-        // strip hash, keep only pathname + search (or drop search if you prefer)
-        u.hash = '';
-        return u.href;
-    } catch {
-        return url;
-    }
-}
 
 function cleanUrlKey(urlStr) {
     try {
@@ -572,9 +568,7 @@ async function downloadWithRetry(url, options = {}, maxRetries = 2) {
             const response = await fetch(url, {
                 ...options,
                 headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': '*/*',
-                    'Accept-Language': 'en-US,en;q=0.9',
+                    ...HEADERS,
                     'Referer': TARGET_URL,
                     ...options.headers
                 }
@@ -838,6 +832,9 @@ async function downloadPage() {
         try {
             configData = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
             
+            if (configData.useViewports && Array.isArray(configData.useViewports)) {
+                VIEWPORTS = configData.useViewports;
+            }
             if (typeof configData.flattenAssets === 'boolean') FLATTEN_ASSETS = configData.flattenAssets;
             if (typeof configData.removeAllScripts === 'boolean') REMOVE_ALL_SCRIPTS = configData.removeAllScripts;
             if (typeof configData.evaluateHTML === 'boolean') EVALUATE_HTML = configData.evaluateHTML;
@@ -1756,6 +1753,7 @@ async function downloadPage() {
     console.log(`✅ Finished! Saved output path: ${rootHtmlPath}`);
     console.log(`📁 Output directory: ${OUTPUT_DIR}`);
     console.log('============================================');
+    
 
 }
 mainPrompts();
