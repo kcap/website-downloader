@@ -1,0 +1,1 @@
+console.log("hello, i'am script from end of body");

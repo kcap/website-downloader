@@ -1,11 +1,11 @@
 {
   "evaluateHTML": false,
-  "waitForDynamicContent": 4000,
+  "waitForDynamicContent": 4000,  
+  "flattenAssets": true,
   "strippedAttributes": ["srcset", "integrity"],
   "disableStrippedAttributes": true,
   "strippedTags": ["iframe", "noscript", "*[id='exampleToStrip']"],
   "commentStrippedTags": true,
-  "flattenAssets": true,
   "removeAllScripts": false,
   "combineAllStyles": false,
   "excludeScripts": [
@@ -22,5 +22,7 @@
     "*fonts.googleapis.com*",
     "*fonts.gstatic.com*",
     "*youtube.com*"
-  ]
+  ],
+  "embedScriptHead": "embed-head.js",
+  "embedScriptBodyEnd": "embed-bodyend.js"
 }

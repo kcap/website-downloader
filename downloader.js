@@ -54,6 +54,9 @@ let strippedAttributes = [];
 let excludedScriptPatterns = [];
 let ignoredPatterns = [];
 
+let EMBED_SCRIPT_HEAD = false;
+let EMBED_SCRIPT_BODY_END = false;
+
 const flatPathRegistry = new Map();
 
 // Keeps one authoritative URL -> relative local path mapping.
@@ -858,6 +861,9 @@ async function downloadPage() {
             if (configData.ignoredSources && Array.isArray(configData.ignoredSources)) {
                 ignoredPatterns = configData.ignoredSources.map(pattern => wildcardToRegex(pattern));
             }
+
+            if (configData.embedScriptHead) EMBED_SCRIPT_HEAD = configData.embedScriptHead;
+            if (configData.embedScriptBodyEnd) EMBED_SCRIPT_BODY_END = configData.embedScriptBodyEnd;
             
             console.log(`[Config Loaded] Evaluate HTML: ${EVALUATE_HTML}, Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Combine Styles: ${COMBINE_ALL_STYLES}, Wait Time: ${WAIT_FOR_DYNAMIC_CONTENT}ms`);
         } catch (e) {
@@ -1301,9 +1307,6 @@ async function downloadPage() {
             }
         }
 
-
-
-
     if (REMOVE_ALL_SCRIPTS) {
         console.log("Purging ALL script tags from target HTML...");
         $('script').remove();
@@ -1520,6 +1523,46 @@ async function downloadPage() {
             }
             element.attr('srcset', newCandidates.join(', '));
         }
+    }
+
+    // Embed script in head
+    if (EMBED_SCRIPT_HEAD) {
+        let scriptContent = '';
+        let scriptPath = path.join(__dirname, EMBED_SCRIPT_HEAD);
+        
+        // Check if it's a file path or raw code
+        if (fs.existsSync(scriptPath)) {
+            // It's a file - read it
+            scriptContent = fs.readFileSync(scriptPath, 'utf-8');
+            console.log(`✅ Embedded script in head from file: ${EMBED_SCRIPT_HEAD}`);
+        } else {
+            // Treat as raw JavaScript code
+            scriptContent = EMBED_SCRIPT_HEAD;
+            console.log(`✅ Embedded raw script in head`);
+        }
+        
+        const scriptTag = `<script>\n${scriptContent}\n</script>`;
+        $('head').append(scriptTag);
+    }
+
+    // Embed script at body end
+    if (EMBED_SCRIPT_BODY_END) {
+        let scriptContent = '';
+        let scriptPath = path.join(__dirname, EMBED_SCRIPT_BODY_END);
+        
+        // Check if it's a file path or raw code
+        if (fs.existsSync(scriptPath)) {
+            // It's a file - read it
+            scriptContent = fs.readFileSync(scriptPath, 'utf-8');
+            console.log(`✅ Embedded script at body end from file: ${EMBED_SCRIPT_BODY_END}`);
+        } else {
+            // Treat as raw JavaScript code
+            scriptContent = EMBED_SCRIPT_BODY_END;
+            console.log(`✅ Embedded raw script at body end`);
+        }
+        
+        const scriptTag = `<script>\n${scriptContent}\n</script>`;
+        $('body').append(scriptTag);
     }
 
     const resourcesToRewrite = [
