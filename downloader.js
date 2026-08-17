@@ -55,6 +55,7 @@ let STRIP_SRCSETS = true;
 let DISABLE_STRIPPED_ATTRIBUTES = false;
 let COMMENT_STRIPPED_TAGS = false;
 let COMBINE_ALL_STYLES = false;
+let USE_SHADOW_ROOTS = false;
 let WAIT_FOR_DYNAMIC_CONTENT = 5000; // Default wait time in ms
 let ERROR_LOG_PATH = '';
 
@@ -562,6 +563,110 @@ async function collectAllStylesAsHTML(page) {
     });
 }
 
+// Serializes the live DOM to a static HTML string, inlining declarative shadow
+// roots (<template shadowrootmode="...">) and any adoptedStyleSheets (both
+// per-shadow-root and document-level) as <style> tags. This runs entirely
+// inside the page context via page.evaluate, so it must be self-contained.
+async function captureHTMLWithShadowRoots(page) {
+    return await page.evaluate(() => {
+        // Helper function to extract CSS from adoptedStyleSheets, including sheet-level media queries
+        function extractAdoptedStyleSheets(sheets) {
+            if (!sheets || !sheets.length) return '';
+            let cssText = '';
+            for (const sheet of sheets) {
+                try {
+                    let sheetRules = Array.from(sheet.cssRules).map(rule => rule.cssText).join('\n');
+
+                    // Preserve sheet-level media conditions (e.g. new CSSStyleSheet({ media: "(max-width: 768px)" }))
+                    const mediaText = sheet.media && sheet.media.mediaText;
+                    if (mediaText) {
+                        sheetRules = `@media ${mediaText} {\n${sheetRules}\n}`;
+                    }
+
+                    cssText += sheetRules + '\n';
+                } catch (e) {
+                    console.warn('Could not read cssRules from adopted sheet:', e);
+                }
+            }
+            return cssText;
+        }
+
+        function serializeNode(node) {
+            // 1. Text Nodes
+            if (node.nodeType === Node.TEXT_NODE) {
+                return node.textContent
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;');
+            }
+
+            // 2. Comment Nodes
+            if (node.nodeType === Node.COMMENT_NODE) {
+                return `<!--${node.nodeValue}-->`;
+            }
+
+            // Skip non-element nodes
+            if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+            const tagName = node.tagName.toLowerCase();
+
+            // Remove <script> tags entirely
+            if (tagName === 'script') return '';
+
+            // Build element attributes
+            let attrs = '';
+            for (const attr of node.attributes) {
+                attrs += ` ${attr.name}="${attr.value.replace(/"/g, '&quot;')}"`;
+            }
+
+            // Handle HTML Void (self-closing) elements
+            const voidTags = new Set([
+                'area', 'base', 'br', 'col', 'embed', 'hr', 'img',
+                'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'
+            ]);
+            if (voidTags.has(tagName)) {
+                return `<${tagName}${attrs}>`;
+            }
+
+            let innerContent = '';
+
+            // 3. Process Shadow Root (Declarative Shadow DOM + Adopted Stylesheets)
+            if (node.shadowRoot) {
+                const shadowCSS = extractAdoptedStyleSheets(node.shadowRoot.adoptedStyleSheets);
+
+                let shadowDOMContent = '';
+                if (shadowCSS) {
+                    shadowDOMContent += `<style>\n${shadowCSS}\n</style>\n`;
+                }
+
+                for (const child of node.shadowRoot.childNodes) {
+                    shadowDOMContent += serializeNode(child);
+                }
+
+                const mode = node.shadowRoot.mode || 'open';
+                innerContent += `<template shadowrootmode="${mode}">\n${shadowDOMContent}\n</template>\n`;
+            }
+
+            // 4. Process global Document-level adoptedStyleSheets inside <head>
+            if (tagName === 'head' && document.adoptedStyleSheets?.length) {
+                const globalCSS = extractAdoptedStyleSheets(document.adoptedStyleSheets);
+                if (globalCSS) {
+                    innerContent += `<style>\n${globalCSS}\n</style>\n`;
+                }
+            }
+
+            // 5. Process Light DOM child nodes
+            for (const child of node.childNodes) {
+                innerContent += serializeNode(child);
+            }
+
+            return `<${tagName}${attrs}>${innerContent}</${tagName}>`;
+        }
+
+        return '<!DOCTYPE html>\n' + serializeNode(document.documentElement);
+    });
+}
+
 async function downloadWithRetry(url, options = {}, maxRetries = 2) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
@@ -848,6 +953,7 @@ async function downloadPage() {
             }            
             if (strippedAttributes.includes("srcset")) STRIP_SRCSETS = true;
             if (typeof configData.combineAllStyles === 'boolean') COMBINE_ALL_STYLES = configData.combineAllStyles;
+            if (typeof configData.useShadowRoots === 'boolean') USE_SHADOW_ROOTS = configData.useShadowRoots;
             if (configData.waitForDynamicContent) {
                 WAIT_FOR_DYNAMIC_CONTENT = configData.waitForDynamicContent;
             }
@@ -862,7 +968,7 @@ async function downloadPage() {
             if (configData.embedScriptHead) EMBED_SCRIPT_HEAD = configData.embedScriptHead;
             if (configData.embedScriptBodyEnd) EMBED_SCRIPT_BODY_END = configData.embedScriptBodyEnd;
             
-            console.log(`[Config Loaded] Evaluate HTML: ${EVALUATE_HTML}, Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Combine Styles: ${COMBINE_ALL_STYLES}, Wait Time: ${WAIT_FOR_DYNAMIC_CONTENT}ms`);
+            console.log(`[Config Loaded] Evaluate HTML: ${EVALUATE_HTML}, Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Combine Styles: ${COMBINE_ALL_STYLES}, Shadow Roots: ${USE_SHADOW_ROOTS}, Wait Time: ${WAIT_FOR_DYNAMIC_CONTENT}ms`);
         } catch (e) {
             console.error(`[Config Error] Could not read config.json: ${e.message}`);
         }
@@ -951,6 +1057,7 @@ async function downloadPage() {
         
         // Now evaluate different viewports
         for (const vp of VIEWPORTS) {
+            if (!vp.use) continue;
             console.log(`\n📱 Evaluating layout for ${vp.name} (${vp.width}x${vp.height})...`);
             await page.setViewport({ 
                 width: vp.width, 
@@ -998,19 +1105,26 @@ async function downloadPage() {
         });
         
         // Capture the final HTML with all dynamic content
-        // finalHtml = await page.evaluate(() => {
-        //     if (typeof document.documentElement.getHTML === 'function') {
-        //         return document.documentElement.getHTML({ includeShadowRoots: true });
-        //     }
-        //     return document.documentElement.outerHTML;
-        // });
-        finalHtml = await page.evaluate(() => {
-            return document.documentElement.outerHTML;
-        });        
-        
+        if (USE_SHADOW_ROOTS) {
+            console.log("🌑 Capturing HTML with shadow roots + adopted stylesheets inlined...");
+            finalHtml = await captureHTMLWithShadowRoots(page);
+        } else {
+            finalHtml = await page.evaluate(() => {
+                return document.documentElement.outerHTML;
+            });
+        }
+
     } else {
-        console.log("📄 Capturing raw source HTML (pre-execution)...");
-        finalHtml = await initialResponse.text();
+        if (USE_SHADOW_ROOTS) {
+            // Shadow roots only exist on the live, JS-executed page, so even when
+            // EVALUATE_HTML is off we still need to pull the HTML from the page
+            // context (rather than the raw pre-execution response body) to see them.
+            console.log("🌑 Capturing HTML with shadow roots + adopted stylesheets inlined (pre full evaluation)...");
+            finalHtml = await captureHTMLWithShadowRoots(page);
+        } else {
+            console.log("📄 Capturing raw source HTML (pre-execution)...");
+            finalHtml = await initialResponse.text();
+        }
     }
 
 
@@ -1039,8 +1153,20 @@ async function downloadPage() {
             console.log("\n--- Processing and saving combined-styles.css ---");
 
             // Step 1: Strip existing style tags and external stylesheet link tags
-            $('style').remove();
-            $('link[rel="stylesheet"]').remove();
+            // (but leave <style> tags that live inside a declarative shadow root's
+            // <template shadowrootmode="..."> alone — those are scoped to that
+            // shadow tree and combining them into the global stylesheet would
+            // both break their encapsulation and remove them from the shadow DOM.)
+            $('style').each((i, el) => {
+                if ($(el).closest('template[shadowrootmode]').length === 0) {
+                    $(el).remove();
+                }
+            });
+            $('link[rel="stylesheet"]').each((i, el) => {
+                if ($(el).closest('template[shadowrootmode]').length === 0) {
+                    $(el).remove();
+                }
+            });
 
             // Step 2: Process url() references in the collected CSS and download assets
             if (rawCombinedCss) {

@@ -1,33 +1,37 @@
 {
     "evaluateHTML": true,
+    "useShadowRoots": true,
     "useViewports": [
     {
         "name": "Desktop",
         "width": 1280,
         "height": 800,
-        "isMobile": false
+        "isMobile": false,
+        "use": true
     },
     {
         "name": "Tablet",
         "width": 768,
         "height": 1024,
         "isMobile": true,
-        "hasTouch": true
+        "hasTouch": true,
+        "use": false
     },
     {
         "name": "Mobile",
         "width": 375,
         "height": 812,
         "isMobile": true,
-        "hasTouch": true
+        "hasTouch": true,
+        "use": false
     }],
     "waitForDynamicContent": 4000,
     "flattenAssets": true,
     "strippedAttributes": ["srcset", "integrity"],
     "disableStrippedAttributes": true,
-    "strippedTags": ["iframe", "noscript", "*[id='exampleToStrip']"],
+    "strippedTags": ["base", "iframe", "noscript", "*[id='exampleToStrip']", "*link[rel='preconnect']", "*link[rel='alternate']"],
     "commentStrippedTags": true,
-    "removeAllScripts": false,
+    "removeAllScripts": true,
     "combineAllStyles": false,
     "excludeScripts": [
         "gtag.js",
@@ -44,6 +48,6 @@
         "*fonts.gstatic.com*",
         "*youtube.com*"
     ],
-    "embedScriptHead": "embed-head.js",
-    "embedScriptBodyEnd": "embed-bodyend.js"
+    "embedScriptHead": false,
+    "embedScriptBodyEnd": false
 }
