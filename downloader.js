@@ -5,8 +5,7 @@ import { URL } from 'url';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import * as cheerio from 'cheerio';
-import readline from 'readline/promises';
-import { stdin as input, stdout as output } from 'process';
+import { log, askUrl, askText, askYesNo, createProgressBar, createPercentBar, createDownloadStatus, exitCleanly } from './terminal-ui.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -42,7 +41,7 @@ const HEADERS = {
 }
 
 let VIEWPORTS = [
-    { name: 'Desktop', width: 1280, height: 800, isMobile: false }
+    { name: 'Desktop', width: 1280, height: 800, isMobile: false, use: true }
 ];
 
 let TARGET_URL = ''; 
@@ -56,6 +55,7 @@ let DISABLE_STRIPPED_ATTRIBUTES = false;
 let COMMENT_STRIPPED_TAGS = false;
 let COMBINE_ALL_STYLES = false;
 let USE_SHADOW_ROOTS = false;
+let REWRITE_JS_ASSET_URLS = true;
 let WAIT_FOR_DYNAMIC_CONTENT = 5000; // Default wait time in ms
 let ERROR_LOG_PATH = '';
 
@@ -64,6 +64,7 @@ let strippedAttributes = [];
 let excludedScriptPatterns = [];
 let ignoredPatterns = [];
 
+let EMBED_STYLE_HEAD = false;
 let EMBED_SCRIPT_HEAD = false;
 let EMBED_SCRIPT_BODY_END = false;
 
@@ -177,7 +178,11 @@ function getFlatRelativePath(requestUrl, contentType = '') {
         const mime = (contentType || '').toLowerCase();
 
         let subDir = 'assets';
-        if (mime.startsWith('image/')) {
+        if (
+            mime.startsWith('image/') ||
+            mime.includes('svg') ||
+            /\.(png|jpe?g|gif|svg|webp|avif|ico|bmp|tiff?)$/i.test(pathname)
+        ) {
             subDir = 'images';
         } else if (
             mime.includes('font') ||
@@ -210,7 +215,9 @@ function getFlatRelativePath(requestUrl, contentType = '') {
         if (!ext) {
             ext = MIME_TO_EXTENSION[mime] || '';
             if (!ext) {
-                if (subDir === 'images') ext = '.png';
+                if (subDir === 'images') {
+                    ext = mime.includes('svg') ? '.svg' : '.png';
+                }
                 else if (subDir === 'fonts') ext = '.woff2';
             }
         }
@@ -373,22 +380,33 @@ function getOrCreateAssetPath(assetUrl, contentType = '') {
     }
 }
 
-async function autoScroll(page) {
-    await page.evaluate(async () => {
-        await new Promise((resolve) => {
-            let totalHeight = 0;
-            const distance = 150;
-            const timer = setInterval(() => {
-                const scrollHeight = document.body.scrollHeight;
-                window.scrollBy(0, distance);
-                totalHeight += distance;
-                if (totalHeight >= scrollHeight || totalHeight > 25000) {
-                    clearInterval(timer);
-                    resolve();
-                }
-            }, 100);
-        });
-    });
+async function autoScroll(page, label = 'Scrolling page') {
+    const distance = 150;
+    const maxHeight = 25000;
+    const stepDelay = 256;
+    let totalHeight = 0;
+
+    const bar = createPercentBar(label);
+
+    try {
+        while (true) {
+            const scrollHeight = await page.evaluate((d) => {
+                window.scrollBy(0, d);
+                return document.body.scrollHeight;
+            }, distance);
+
+            totalHeight += distance;
+            const target = Math.min(scrollHeight, maxHeight) || 1;
+            bar.update(totalHeight / target);
+
+            if (totalHeight >= scrollHeight || totalHeight > maxHeight) break;
+
+            await new Promise(resolve => setTimeout(resolve, stepDelay));
+        }
+    } finally {
+        bar.update(1);
+        bar.stop();
+    }
 }
 
 function rewriteCssUrls(cssText, baseUrl) {
@@ -425,6 +443,103 @@ function rewriteCssUrls(cssText, baseUrl) {
         }
     );
 }
+
+// Rewrites embedded asset references inside a downloaded standalone file (typically
+// a .js bundle) so they point at the locally-downloaded copies instead of the
+// original absolute/site-root URLs. Handles two shapes:
+//   1. CSS-style url(...) references — common when a bundle injects <style> text
+//      or inline style strings at runtime (e.g. background: url('/assets/x.svg')).
+//   2. Bare quoted absolute-root paths ending in a known static-asset extension
+//      (e.g. '/assets/icons/x.svg') — common when bundlers bake icon/image paths
+//      straight into JS as plain string literals rather than inside url().
+// `fileInfo` is { localPath, originalUrl } (the same shape used for savedCssFiles).
+async function rewriteEmbeddedAssetUrls(fileInfo, urlContentTypeMap, { includeBareStringPaths = false } = {}) {
+
+    try {
+        let content = fs.readFileSync(fileInfo.localPath, 'utf-8');
+        let changed = false;
+
+        const patterns = [
+            // url('...') / url("...") / url(...)
+            { regex: /url\(\s*(['"]?)([^'")]+)\1\s*\)/g, urlGroup: 2, quoteGroup: 1, isUrlFn: true }
+        ];
+
+        if (includeBareStringPaths) {
+            patterns.push({
+                regex: /(['"])(\/[^'"\\]+?\.(?:svg|png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot))\1/g,
+                urlGroup: 2,
+                quoteGroup: 1,
+                isUrlFn: false
+            });
+        }
+
+        for (const { regex, urlGroup, quoteGroup, isUrlFn } of patterns) {
+            const matches = [...content.matchAll(regex)];
+            if (!matches.length) continue;
+
+            // Resolve replacements first (async work), keyed by the exact matched
+            // text, then apply them in a single synchronous pass so every
+            // occurrence (including duplicates) gets fixed correctly.
+            const replacementMap = new Map();
+
+            for (const match of matches) {
+                const fullMatch = match[0];
+                const originalUrl = match[urlGroup];
+                const quote = match[quoteGroup] || '"';
+
+                if (replacementMap.has(fullMatch)) continue;
+                if (!originalUrl || originalUrl.startsWith('data:') || originalUrl.startsWith('#')) continue;
+
+                try {
+                    const absoluteUrl = new URL(originalUrl, fileInfo.originalUrl).href;
+
+                    if (ignoredPatterns.some(p => p.test(absoluteUrl))) continue;
+
+                    const registryKey = cleanUrlKey(absoluteUrl);
+                    let knownContentType = urlContentTypeMap.get(registryKey) || '';
+
+                    let localRelativePath = getOrCreateAssetPath(absoluteUrl, knownContentType);
+                    let absoluteAssetPath = path.join(OUTPUT_DIR, localRelativePath);
+
+                    if (!fs.existsSync(absoluteAssetPath)) {
+                        const result = await safeDownload(absoluteUrl, absoluteAssetPath, knownContentType);
+                        if (result.success) {
+                            knownContentType = result.contentType || '';
+                            urlContentTypeMap.set(registryKey, knownContentType);
+                        }
+                    }
+
+                    localRelativePath = getOrCreateAssetPath(absoluteUrl, knownContentType);
+                    absoluteAssetPath = path.join(OUTPUT_DIR, localRelativePath);
+
+                    const fileDirectory = path.dirname(fileInfo.localPath);
+                    let relativeToFile = path.relative(fileDirectory, absoluteAssetPath).replace(/\\/g, '/');
+                    if (!relativeToFile.startsWith('.')) relativeToFile = './' + relativeToFile;
+
+                    const replacement = isUrlFn
+                        ? `url("${relativeToFile}")`
+                        : `${quote}${relativeToFile}${quote}`;
+
+                    replacementMap.set(fullMatch, replacement);
+                } catch (e) {
+                    log.error(`Embedded asset URL rewrite failed in ${fileInfo.localPath}: ${originalUrl} - ${e.message}`);
+                }
+            }
+
+            if (replacementMap.size > 0) {
+                content = content.replace(regex, (m) => replacementMap.has(m) ? replacementMap.get(m) : m);
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            fs.writeFileSync(fileInfo.localPath, content, 'utf-8');
+        }
+    } catch (e) {
+        log.error(`Embedded asset processing error: ${fileInfo.localPath} - ${e.message}`);
+    }
+}
+
 
 function parseSrcset(srcsetString) {
     const parts = srcsetString.split(',');
@@ -696,12 +811,21 @@ async function downloadWithRetry(url, options = {}, maxRetries = 2) {
     }
 }
 
+let downloadStatus = null;
+
+function getDownloadStatus() {
+    if (!downloadStatus) downloadStatus = createDownloadStatus();
+    return downloadStatus;
+}
+
 async function safeDownload(url, localPath, contentType = '') {
     downloadStats.totalFiles++;
+    getDownloadStatus().update(downloadStats);
 
     try {
         if (ignoredPatterns.some(regex => regex.test(url))) {
             downloadStats.skipped++;
+            getDownloadStatus().update(downloadStats);
             return {
                 success: false,
                 reason: 'ignored'
@@ -724,6 +848,7 @@ async function safeDownload(url, localPath, contentType = '') {
             }
 
             downloadStats.downloaded++;
+            getDownloadStatus().update(downloadStats);
 
             return {
                 success: true,
@@ -735,6 +860,7 @@ async function safeDownload(url, localPath, contentType = '') {
 
     } catch (error) {
         downloadStats.failed++;
+        getDownloadStatus().update(downloadStats);
 
         const errorMsg =
             `[${error.status || 'ERROR'}] ${url} -> ${error.message}`;
@@ -752,7 +878,7 @@ async function safeDownload(url, localPath, contentType = '') {
 
 // Simplified wait for dynamic content - just wait for network idle and stability
 async function waitForDynamicContent(page, timeout = 10000) {
-    console.log(`⏳ Waiting ${timeout/1000}s for dynamic content to load...`);
+    log.info(`Waiting ${timeout/1000}s for dynamic content to load...`);
     
     const startTime = Date.now();
     let lastHTML = '';
@@ -765,7 +891,7 @@ async function waitForDynamicContent(page, timeout = 10000) {
         idleTime: 2000, 
         timeout: timeout 
     }).catch(() => {
-        console.log(`⏱️  Network idle timeout reached, continuing...`);
+        log.info(`Network idle timeout reached, continuing...`);
     });
     
     // Then wait for the DOM to become stable (not changing)
@@ -781,7 +907,7 @@ async function waitForDynamicContent(page, timeout = 10000) {
         
         // If HTML is stable for required checks, break
         if (stableChecks >= requiredStableChecks) {
-            console.log(`✅ Page HTML stable after ${Math.round((Date.now() - startTime)/1000)}s`);
+            log.success(`Page HTML stable after ${Math.round((Date.now() - startTime)/1000)}s`);
             break;
         }
         
@@ -789,70 +915,56 @@ async function waitForDynamicContent(page, timeout = 10000) {
     }
     
     // Additional wait for any lazy-loaded content to appear
-    await page.evaluate(() => {
-        return new Promise((resolve) => {
-            // Trigger lazy loading by scrolling
-            let lastHeight = document.body.scrollHeight;
-            let scrollCount = 0;
-            const maxScrolls = 3;
-            
-            const scrollInterval = setInterval(() => {
-                window.scrollBy(0, 500);
-                scrollCount++;
-                
-                setTimeout(() => {
-                    const newHeight = document.body.scrollHeight;
-                    if (newHeight === lastHeight || scrollCount >= maxScrolls) {
-                        clearInterval(scrollInterval);
-                        window.scrollTo(0, 0);
-                        resolve();
-                    }
-                    lastHeight = newHeight;
-                }, 300);
-            }, 500);
-            
-            // Fallback resolve after 3 seconds
-            setTimeout(() => {
-                clearInterval(scrollInterval);
-                window.scrollTo(0, 0);
-                resolve();
-            }, 3000);
-        });
-    });
+    {
+        const maxScrolls = 3;
+        let lastHeight = await page.evaluate(() => document.body.scrollHeight);
+        const bar = createProgressBar('Triggering lazy-load scroll', maxScrolls);
+
+        for (let i = 0; i < maxScrolls; i++) {
+            await page.evaluate(() => window.scrollBy(0, 500));
+            await new Promise(resolve => setTimeout(resolve, 300));
+
+            const newHeight = await page.evaluate(() => document.body.scrollHeight);
+            bar.step(`pass ${i + 1}/${maxScrolls}`);
+
+            if (newHeight === lastHeight) break;
+            lastHeight = newHeight;
+        }
+
+        await page.evaluate(() => window.scrollTo(0, 0));
+        bar.stop();
+    }
     
     // Final small delay for any post-scroll rendering
     await new Promise(resolve => setTimeout(resolve, 1000));
     
-    console.log(`⏱️  Total wait time: ${Math.round((Date.now() - startTime)/1000)}s`);
+    log.info(`Total wait time: ${Math.round((Date.now() - startTime)/1000)}s`);
 }
 
 async function mainPrompts() {
-    const rl = readline.createInterface({ input, output });
+    log.title('Website Downloader');
 
-    let inputUrl = await rl.question('Enter website URL: ');
-    if (!inputUrl.startsWith('http://') && !inputUrl.startsWith('https://')) {
-        inputUrl = 'https://' + inputUrl;
-    }
-    TARGET_URL = inputUrl;
+    TARGET_URL = await askUrl('Enter website URL: ');
 
     const defaultFolderName = getDomain(TARGET_URL);
-    const inputFolder = await rl.question(`Enter output folder name (Default: ${defaultFolderName}): `);
-    const folderName = inputFolder.trim() || defaultFolderName;
+    const folderName = (await askText('Enter output folder name: ', defaultFolderName)) || defaultFolderName;
     OUTPUT_DIR = path.join(__dirname, 'downloaded_site', folderName);
     ERROR_LOG_PATH = path.join(OUTPUT_DIR, 'errorlog.txt');
 
     if (fs.existsSync(OUTPUT_DIR)) {
         const files = fs.readdirSync(OUTPUT_DIR);
         if (files.length > 0) {
-            const cleanConfirm = await rl.question(`\nWarning: The folder "${folderName}" already contains files.\nDo you want to empty this folder first? (yes/no, Default: no): `);
-            if (cleanConfirm.toLowerCase().trim() === 'yes' || cleanConfirm.toLowerCase().trim() === 'y') {
-                console.log(`Emptying folder: ${OUTPUT_DIR}...`);
+            const shouldEmpty = await askYesNo(
+                `Warning: the folder "${folderName}" already contains files. Empty it first?`,
+                false
+            );
+            if (shouldEmpty) {
+                log.info(`Emptying folder: ${OUTPUT_DIR}...`);
                 fs.rmSync(OUTPUT_DIR, { recursive: true, force: true });
             }
         }
     }
 
-    rl.close();
     await downloadPage();
 }
 
@@ -917,13 +1029,13 @@ function writeErrorLog() {
             'utf-8'
         );
 
-        console.log(
-            `⚠️ ${downloadStats.errors.length} download errors saved to: ${ERROR_LOG_PATH}`
+        log.info(
+            `${downloadStats.errors.length} download errors saved to: ${ERROR_LOG_PATH}`
         );
 
     } catch (error) {
-        console.error(
-            `❌ Could not write errorlog.txt: ${error.message}`
+        log.error(
+            `Could not write errorlog.txt: ${error.message}`
         );
     }
 }
@@ -954,6 +1066,7 @@ async function downloadPage() {
             if (strippedAttributes.includes("srcset")) STRIP_SRCSETS = true;
             if (typeof configData.combineAllStyles === 'boolean') COMBINE_ALL_STYLES = configData.combineAllStyles;
             if (typeof configData.useShadowRoots === 'boolean') USE_SHADOW_ROOTS = configData.useShadowRoots;
+            if (typeof configData.rewriteAssetUrlsInJs === 'boolean') REWRITE_JS_ASSET_URLS = configData.rewriteAssetUrlsInJs;
             if (configData.waitForDynamicContent) {
                 WAIT_FOR_DYNAMIC_CONTENT = configData.waitForDynamicContent;
             }
@@ -965,12 +1078,13 @@ async function downloadPage() {
                 ignoredPatterns = configData.ignoredSources.map(pattern => wildcardToRegex(pattern));
             }
 
+            if (configData.embedStyleHead) EMBED_STYLE_HEAD = configData.embedStyleHead;
             if (configData.embedScriptHead) EMBED_SCRIPT_HEAD = configData.embedScriptHead;
             if (configData.embedScriptBodyEnd) EMBED_SCRIPT_BODY_END = configData.embedScriptBodyEnd;
             
-            console.log(`[Config Loaded] Evaluate HTML: ${EVALUATE_HTML}, Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Combine Styles: ${COMBINE_ALL_STYLES}, Shadow Roots: ${USE_SHADOW_ROOTS}, Wait Time: ${WAIT_FOR_DYNAMIC_CONTENT}ms`);
+            log.info(`[Config Loaded] Evaluate HTML: ${EVALUATE_HTML}, Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Combine Styles: ${COMBINE_ALL_STYLES}, Shadow Roots: ${USE_SHADOW_ROOTS}, Rewrite JS Asset URLs: ${REWRITE_JS_ASSET_URLS}, Wait Time: ${WAIT_FOR_DYNAMIC_CONTENT}ms`);
         } catch (e) {
-            console.error(`[Config Error] Could not read config.json: ${e.message}`);
+            log.error(`[Config Error] Could not read config.json: ${e.message}`);
         }
     }
 
@@ -989,6 +1103,7 @@ async function downloadPage() {
 
     const urlContentTypeMap = new Map();
     const savedCssFiles = new Set();
+    const savedJsFiles = new Set();
 
     await page.setRequestInterception(true);
 
@@ -1012,7 +1127,7 @@ async function downloadPage() {
                 const isFont = url.match(/\.(woff2?|ttf|otf|eot)$/i) || 
                               (contentType && contentType.match(/font|woff|ttf|otf/));
                 if (isFont) {
-                    console.warn(`⚠️  Font ${status}: ${url}`);
+                    log.warn(`Font ${status}: ${url}`);
                 }
                 downloadStats.missingFiles.add(url);
             }
@@ -1037,13 +1152,16 @@ async function downloadPage() {
             if (result.success && (contentType.toLowerCase().includes('css') || url.split('?')[0].endsWith('.css'))) {
                 savedCssFiles.add({ localPath, originalUrl: url });
             }
+            if (result.success && (contentType.toLowerCase().includes('javascript') || /\.js$/i.test(url.split('?')[0]))) {
+                savedJsFiles.add({ localPath, originalUrl: url });
+            }
         } catch (err) {
-            // console.warn(`⚠️  Download error: ${url} - ${err.message}`);
+            // log.warn(`Download error: ${url} - ${err.message}`);
             downloadStats.missingFiles.add(url);
         }
     });
 
-    console.log(`\nNavigating to ${TARGET_URL}...`);
+    log.info(`\nNavigating to ${TARGET_URL}...`);
     const initialResponse = await page.goto(TARGET_URL, { 
         waitUntil: 'networkidle2', 
         timeout: 60000 
@@ -1058,7 +1176,7 @@ async function downloadPage() {
         // Now evaluate different viewports
         for (const vp of VIEWPORTS) {
             if (!vp.use) continue;
-            console.log(`\n📱 Evaluating layout for ${vp.name} (${vp.width}x${vp.height})...`);
+            log.info(`\nEvaluating layout for ${vp.name} (${vp.width}x${vp.height})...`);
             await page.setViewport({ 
                 width: vp.width, 
                 height: vp.height, 
@@ -1075,7 +1193,7 @@ async function downloadPage() {
             });
             
             // Scroll to load lazy content
-            await autoScroll(page);
+            await autoScroll(page, `Scrolling layout (${vp.name})`);
             
             // Wait a bit for layout to settle
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -1085,7 +1203,7 @@ async function downloadPage() {
         await page.setViewport(VIEWPORTS[0]);
         await page.evaluate(() => window.scrollTo(0, 0));
 
-        console.log("\n📸 Capturing fully evaluated HTML...");
+        log.info("\nCapturing fully evaluated HTML...");
         
         // One final check for stability
         await page.evaluate(() => {
@@ -1106,7 +1224,7 @@ async function downloadPage() {
         
         // Capture the final HTML with all dynamic content
         if (USE_SHADOW_ROOTS) {
-            console.log("🌑 Capturing HTML with shadow roots + adopted stylesheets inlined...");
+            log.info("Capturing HTML with shadow roots + adopted stylesheets inlined...");
             finalHtml = await captureHTMLWithShadowRoots(page);
         } else {
             finalHtml = await page.evaluate(() => {
@@ -1119,10 +1237,10 @@ async function downloadPage() {
             // Shadow roots only exist on the live, JS-executed page, so even when
             // EVALUATE_HTML is off we still need to pull the HTML from the page
             // context (rather than the raw pre-execution response body) to see them.
-            console.log("🌑 Capturing HTML with shadow roots + adopted stylesheets inlined (pre full evaluation)...");
+            log.info("Capturing HTML with shadow roots + adopted stylesheets inlined (pre full evaluation)...");
             finalHtml = await captureHTMLWithShadowRoots(page);
         } else {
-            console.log("📄 Capturing raw source HTML (pre-execution)...");
+            log.info("Capturing raw source HTML (pre-execution)...");
             finalHtml = await initialResponse.text();
         }
     }
@@ -1130,11 +1248,11 @@ async function downloadPage() {
 
     let rawCombinedCss = '';
         if (COMBINE_ALL_STYLES) {
-            console.log("\n🎨 Combining all page styles into a single stylesheet...");
+            log.info("\nCombining all page styles into a single stylesheet...");
             try {
                 rawCombinedCss = await collectAllStylesAsHTML(page);
             } catch (err) {
-                console.error(`❌ Failed to collect page styles: ${err.message}`);
+                log.error(`Failed to collect page styles: ${err.message}`);
             }
         }
 
@@ -1150,7 +1268,7 @@ async function downloadPage() {
 
 
     if (COMBINE_ALL_STYLES) {
-            console.log("\n--- Processing and saving combined-styles.css ---");
+            log.section("Processing and saving combined-styles.css");
 
             // Step 1: Strip existing style tags and external stylesheet link tags
             // (but leave <style> tags that live inside a declarative shadow root's
@@ -1217,7 +1335,7 @@ async function downloadPage() {
                         processedCss = processedCss.replace(match[0], `url("${relativeToCss}")`);
 
                     } catch (e) {
-                        console.error(`Combined CSS URL error: ${originalUrl} - ${e.message}`);
+                        log.error(`Combined CSS URL error: ${originalUrl} - ${e.message}`);
                     }
                 }
 
@@ -1258,14 +1376,18 @@ async function downloadPage() {
             });
 
             if (savedCssFiles.size > 0) {
-                console.log(
-                    `\n--- Processing ${savedCssFiles.size} standalone CSS file(s) for asset links ---`
-                );
+                log.section(`Processing ${savedCssFiles.size} standalone CSS file(s) for asset links`);
+                const cssBar = createProgressBar('CSS files', savedCssFiles.size);
 
                 for (const cssFile of savedCssFiles) {
+
                     if (!fs.existsSync(cssFile.localPath)) {
+                        cssBar.step(path.basename(cssFile.localPath));
                         continue;
                     }
+
+                    cssBar.step(path.basename(cssFile.localPath));
+
 
                     try {
                         let cssContent = fs.readFileSync(
@@ -1409,7 +1531,7 @@ async function downloadPage() {
                                     );
 
                             } catch (e) {
-                                console.error(
+                                log.error(
                                     `CSS URL processing failed: ${originalUrl} - ${e.message}`
                                 );
                             }
@@ -1422,16 +1544,33 @@ async function downloadPage() {
                         );
 
                     } catch (e) {
-                        console.error(
-                            `❌ CSS processing error: ${cssFile.localPath} - ${e.message}`
+                        log.error(
+                            `CSS processing error: ${cssFile.localPath} - ${e.message}`
                         );
                     }
                 }
+                cssBar.stop();
             }
         }
 
+    // Fix up hardcoded absolute/site-root asset paths baked into downloaded JS
+    // bundles (e.g. CSS-in-JS strings like background: url('/assets/x.svg')).
+    // These live outside any <style>/<link> tag cheerio can see, so they need
+    // their own pass regardless of whether COMBINE_ALL_STYLES is on.
+    if (REWRITE_JS_ASSET_URLS && savedJsFiles.size > 0) {
+        log.section(`Processing ${savedJsFiles.size} standalone JS file(s) for embedded asset links`);
+        const jsBar = createProgressBar('JS files', savedJsFiles.size);
+        for (const jsFile of savedJsFiles) {
+            if (!fs.existsSync(jsFile.localPath)) return;
+
+            jsBar.step(path.basename(jsFile.localPath));
+            await rewriteEmbeddedAssetUrls(jsFile, urlContentTypeMap, { includeBareStringPaths: true });
+        }
+        jsBar.stop();
+    }
+
     if (REMOVE_ALL_SCRIPTS) {
-        console.log("Purging ALL script tags from target HTML...");
+        log.info("\nPurging ALL script tags from target HTML...");
         $('script').remove();
         $('*').each((i, el) => {
             for (const attr in el.attribs) {
@@ -1520,7 +1659,7 @@ async function downloadPage() {
         $('head').prepend(dynamicBlockerScript);
     }
 
-    console.log("\nStripping tags: " + strippedTags.join(", ") + (COMMENT_STRIPPED_TAGS ? ' (comment mode) ' : ''));
+    log.info("\nStripping tags: " + strippedTags.join(", ") + (COMMENT_STRIPPED_TAGS ? ' (comment mode) ' : ''));
     for(const tag of strippedTags) {
         if (COMMENT_STRIPPED_TAGS) {
             // Comment out the tag instead of removing it
@@ -1536,7 +1675,7 @@ async function downloadPage() {
         }
     }
 
-    console.log("\nStripping attributes: " + strippedAttributes.join(", ") + (DISABLE_STRIPPED_ATTRIBUTES ? ' (disable mode) ' : ''));
+    log.info("\nStripping attributes: " + strippedAttributes.join(", ") + (DISABLE_STRIPPED_ATTRIBUTES ? ' (disable mode) ' : ''));
     for(const attr of strippedAttributes) {
         if (DISABLE_STRIPPED_ATTRIBUTES) {
             // Add prefix to disable the attribute instead of removing it
@@ -1554,7 +1693,7 @@ async function downloadPage() {
     }
 
     if (!STRIP_SRCSETS) {
-        console.log("\nEvaluating and downloading responsive images (srcset)...");
+        log.info("\nEvaluating and downloading responsive images (srcset)...");
         const srcsetElements = $('*[srcset]').toArray();
         
         for (const el of srcsetElements) {
@@ -1627,8 +1766,8 @@ async function downloadPage() {
                             }
 
                         } catch (fetchErr) {
-                            console.warn(
-                                `⚠️ srcset download failed: ${absoluteUrl} - ${fetchErr.message}`
+                            log.warn(
+                                `srcset download failed: ${absoluteUrl} - ${fetchErr.message}`
                             );
                         }
                     }
@@ -1648,6 +1787,26 @@ async function downloadPage() {
         }
     }
 
+    // Embed styles in head
+    if (EMBED_STYLE_HEAD) {
+        let styleContent = '';
+        let stylePath = path.join(__dirname, EMBED_STYLE_HEAD);
+        
+        // Check if it's a file path or raw code
+        if (fs.existsSync(stylePath)) {
+            // It's a file - read it
+            styleContent = fs.readFileSync(stylePath, 'utf-8');
+            log.success(`Embedded style in head from file: ${EMBED_STYLE_HEAD}`);
+        } else {
+            // Treat as raw CSS code
+            styleContent = EMBED_STYLE_HEAD;
+            log.success(`Embedded raw style in head`);
+        }
+        
+        const styleTag = `<style>\n${styleContent}\n</style>`;
+        $('head').append(styleTag);
+    }    
+
     // Embed script in head
     if (EMBED_SCRIPT_HEAD) {
         let scriptContent = '';
@@ -1657,11 +1816,11 @@ async function downloadPage() {
         if (fs.existsSync(scriptPath)) {
             // It's a file - read it
             scriptContent = fs.readFileSync(scriptPath, 'utf-8');
-            console.log(`✅ Embedded script in head from file: ${EMBED_SCRIPT_HEAD}`);
+            log.success(`Embedded script in head from file: ${EMBED_SCRIPT_HEAD}`);
         } else {
             // Treat as raw JavaScript code
             scriptContent = EMBED_SCRIPT_HEAD;
-            console.log(`✅ Embedded raw script in head`);
+            log.success(`Embedded raw script in head`);
         }
         
         const scriptTag = `<script>\n${scriptContent}\n</script>`;
@@ -1677,11 +1836,11 @@ async function downloadPage() {
         if (fs.existsSync(scriptPath)) {
             // It's a file - read it
             scriptContent = fs.readFileSync(scriptPath, 'utf-8');
-            console.log(`✅ Embedded script at body end from file: ${EMBED_SCRIPT_BODY_END}`);
+            log.success(`Embedded script at body end from file: ${EMBED_SCRIPT_BODY_END}`);
         } else {
             // Treat as raw JavaScript code
             scriptContent = EMBED_SCRIPT_BODY_END;
-            console.log(`✅ Embedded raw script at body end`);
+            log.success(`Embedded raw script at body end`);
         }
         
         const scriptTag = `<script>\n${scriptContent}\n</script>`;
@@ -1693,7 +1852,7 @@ async function downloadPage() {
         { selector: '*[href]', attr: 'href' }
     ];
 
-    console.log("\n--- Running asset link processing ---");
+    log.section("Running asset link processing");
     for (const { selector, attr } of resourcesToRewrite) {
         const elements = $(selector).toArray();
         for (const el of elements) {
@@ -1730,7 +1889,7 @@ async function downloadPage() {
         }
     }
 
-    console.log("\n--- Scanning inline scripts for hidden dynamic assets ---");
+    log.section("Scanning inline scripts for hidden dynamic assets");
         
     const inlineScripts = $('script:not([src])').toArray();
     for (const el of inlineScripts) {
@@ -1783,7 +1942,7 @@ async function downloadPage() {
 
     const optimizedHtml = $.html({ decodeEntities: false });
 
-    console.log("\nSaving index.html layout file...");
+    log.info("\nSaving index.html layout file...");
     const rootHtmlPath = path.join(OUTPUT_DIR, 'index.html');
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     fs.writeFileSync(rootHtmlPath, optimizedHtml, 'utf-8'); 
@@ -1811,7 +1970,7 @@ async function downloadPage() {
             if (stat.isDirectory()) {
                 removeEmptyFiles(filePath);
             } else if (stat.size === 0) {
-                console.warn(`⚠️  Removing 0-byte file: ${filePath}`);
+                log.warn(`Removing 0-byte file: ${filePath}`);
                 try { fs.unlinkSync(filePath); } catch (e) {}
             }
         }
@@ -1820,17 +1979,17 @@ async function downloadPage() {
     removeEmptyFiles(OUTPUT_DIR);
 
     writeErrorLog();
-    
-    console.log('\n============================================');
-    console.log('📊 DOWNLOAD SUMMARY');
-    console.log('============================================');
-    console.log(`✅ Total files processed: ${downloadStats.totalFiles}`);
-    console.log(`✅ Successfully downloaded: ${downloadStats.downloaded}`);
-    console.log(`⚠️  Failed downloads: ${downloadStats.failed}`);
-    console.log(`⏭️  Skipped (ignored patterns): ${downloadStats.skipped}`);
+
+    if (downloadStatus) downloadStatus.stop();
+
+    log.title('DOWNLOAD SUMMARY');
+    log.success(`Total files processed: ${downloadStats.totalFiles}`);
+    log.success(`Successfully downloaded: ${downloadStats.downloaded}`);
+    (downloadStats.failed > 0 ? log.warn : log.info)(`Failed downloads: ${downloadStats.failed}`);
+    log.info(`Skipped (ignored patterns): ${downloadStats.skipped}`);
     
     if (downloadStats.missingFiles.size > 0) {
-        console.log('\n⚠️  MISSING FILES (404 or download errors):');
+        log.section('MISSING FILES (404 or download errors)');
         const missingArray = Array.from(downloadStats.missingFiles);
         const fonts = missingArray.filter(url => url.match(/\.(woff2?|ttf|otf|eot)$/i));
         const images = missingArray.filter(url => url.match(/\.(jpg|jpeg|png|gif|webp|svg|ico)$/i));
@@ -1839,47 +1998,39 @@ async function downloadPage() {
         const other = missingArray.filter(url => 
             !fonts.includes(url) && !images.includes(url) && !css.includes(url) && !js.includes(url)
         );
-        
-        if (fonts.length > 0) {
-            console.log(`\n  🖋️  Fonts (${fonts.length}):`);
-            fonts.slice(0, 5).forEach(url => console.log(`    - ${url}`));
-            if (fonts.length > 5) console.log(`    ... and ${fonts.length - 5} more fonts`);
-        }
-        if (images.length > 0) {
-            console.log(`\n  🖼️  Images (${images.length}):`);
-            images.slice(0, 5).forEach(url => console.log(`    - ${url}`));
-            if (images.length > 5) console.log(`    ... and ${images.length - 5} more images`);
-        }
-        if (css.length > 0) {
-            console.log(`\n  📄 CSS (${css.length}):`);
-            css.slice(0, 5).forEach(url => console.log(`    - ${url}`));
-            if (css.length > 5) console.log(`    ... and ${css.length - 5} more CSS files`);
-        }
-        if (js.length > 0) {
-            console.log(`\n  📜 JavaScript (${js.length}):`);
-            js.slice(0, 5).forEach(url => console.log(`    - ${url}`));
-            if (js.length > 5) console.log(`    ... and ${js.length - 5} more JS files`);
-        }
-        if (other.length > 0) {
-            console.log(`\n  📁 Other (${other.length}):`);
-            other.slice(0, 5).forEach(url => console.log(`    - ${url}`));
-            if (other.length > 5) console.log(`    ... and ${other.length - 5} more files`);
-        }
+
+        const printGroup = (label, urls) => {
+            if (urls.length === 0) return;
+            log.warn(`  ${label} (${urls.length}):`);
+            urls.slice(0, 5).forEach(url => log.dim(`    - ${url}`));
+            if (urls.length > 5) log.dim(`    ... and ${urls.length - 5} more`);
+        };
+
+        printGroup('Fonts', fonts);
+        printGroup('Images', images);
+        printGroup('CSS', css);
+        printGroup('JavaScript', js);
+        printGroup('Other', other);
     }
     
     if (downloadStats.errors.length > 0) {
-        console.log('\n❌ ERROR LOG (first 10):');
-        downloadStats.errors.slice(0, 10).forEach(error => console.log(`  - ${error}`));
+        log.section('ERROR LOG (first 10)');
+        downloadStats.errors.slice(0, 10).forEach(error => log.dim(`  - ${error}`));
         if (downloadStats.errors.length > 10) {
-            console.log(`  ... and ${downloadStats.errors.length - 10} more errors`);
+            log.dim(`  ... and ${downloadStats.errors.length - 10} more errors`);
         }
     }
-    
-    console.log(`\n============================================`);
-    console.log(`✅ Finished! Saved output path: ${rootHtmlPath}`);
-    console.log(`📁 Output directory: ${OUTPUT_DIR}`);
-    console.log('============================================');
-    
+
+    log.info('============================================');
+    log.success(`Finished! Saved output path: ${rootHtmlPath}`);
+    log.info(`Output directory: ${OUTPUT_DIR}`);
+    log.info('============================================');
 
 }
-mainPrompts();
+
+mainPrompts()
+    .then(() => exitCleanly(0))
+    .catch((err) => {
+        log.error(`Fatal error: ${err.message}`);
+        exitCleanly(1);
+    });
