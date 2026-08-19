@@ -51,5 +51,14 @@
     ],
     "embedStyleHead": false,
     "embedScriptHead": false,
-    "embedScriptBodyEnd": false
+    "embedScriptBodyEnd": false,
+
+    "enableReplaces": true,
+    "replacesJs": [],
+    "replacesCss": [],
+    "replacesHtml": [
+        { "find": "OLD_API_URL", "replace": "https://api.example.com" }
+    ],
+
+    "beautifyHtml": true
 }

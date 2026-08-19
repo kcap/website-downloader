@@ -5,6 +5,7 @@ import { URL } from 'url';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import * as cheerio from 'cheerio';
+import beautify from 'js-beautify';
 import { log, askUrl, askText, askYesNo, createProgressBar, createPercentBar, createDownloadStatus, exitCleanly } from './terminal-ui.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -67,6 +68,12 @@ let ignoredPatterns = [];
 let EMBED_STYLE_HEAD = false;
 let EMBED_SCRIPT_HEAD = false;
 let EMBED_SCRIPT_BODY_END = false;
+
+let ENABLE_REPLACES = true;
+let REPLACES_JS = [];
+let REPLACES_CSS = [];
+let REPLACES_HTML = [];
+let BEAUTIFY_HTML = false;
 
 const flatPathRegistry = new Map();
 
@@ -137,6 +144,40 @@ function wildcardToRegex(wildcardStr) {
     let escaped = wildcardStr.replace(/[.+^${}()|[\]\\]/g, '\\$&');
     escaped = escaped.replace(/\*/g, '.*').replace(/\?/g, '.');
     return new RegExp('^' + escaped + '$', 'i');
+}
+
+/**
+ * Applies a list of configured find/replace rules to a text blob (JS, CSS
+ * or HTML source). Each rule looks like:
+ *   { "find": "foo", "replace": "bar" }                         // literal, replaces every occurrence
+ *   { "find": "foo\\d+", "replace": "bar", "regex": true }       // regex, flags default to "g"
+ *   { "find": "foo\\d+", "replace": "bar", "regex": true, "flags": "gi" }
+ *
+ * Replaces are skipped entirely when ENABLE_REPLACES is false, so users
+ * don't have to empty out every array to turn the feature off.
+ */
+function applyTextReplaces(content, rules, label = '') {
+    if (!ENABLE_REPLACES || !Array.isArray(rules) || rules.length === 0) {
+        return content;
+    }
+
+    for (const rule of rules) {
+        if (!rule || typeof rule.find !== 'string') continue;
+        const replacement = typeof rule.replace === 'string' ? rule.replace : '';
+
+        try {
+            if (rule.regex) {
+                const flags = typeof rule.flags === 'string' ? rule.flags : 'g';
+                content = content.replace(new RegExp(rule.find, flags), replacement);
+            } else {
+                content = content.split(rule.find).join(replacement);
+            }
+        } catch (e) {
+            log.error(`Replace rule failed${label ? ` (${label})` : ''}: "${rule.find}" - ${e.message}`);
+        }
+    }
+
+    return content;
 }
 
 function sanitizeFileName(filename) {
@@ -1081,8 +1122,14 @@ async function downloadPage() {
             if (configData.embedStyleHead) EMBED_STYLE_HEAD = configData.embedStyleHead;
             if (configData.embedScriptHead) EMBED_SCRIPT_HEAD = configData.embedScriptHead;
             if (configData.embedScriptBodyEnd) EMBED_SCRIPT_BODY_END = configData.embedScriptBodyEnd;
+
+            if (typeof configData.enableReplaces === 'boolean') ENABLE_REPLACES = configData.enableReplaces;
+            if (configData.replacesJs && Array.isArray(configData.replacesJs)) REPLACES_JS = configData.replacesJs;
+            if (configData.replacesCss && Array.isArray(configData.replacesCss)) REPLACES_CSS = configData.replacesCss;
+            if (configData.replacesHtml && Array.isArray(configData.replacesHtml)) REPLACES_HTML = configData.replacesHtml;
+            if (typeof configData.beautifyHtml === 'boolean') BEAUTIFY_HTML = configData.beautifyHtml;
             
-            log.info(`[Config Loaded] Evaluate HTML: ${EVALUATE_HTML}, Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Combine Styles: ${COMBINE_ALL_STYLES}, Shadow Roots: ${USE_SHADOW_ROOTS}, Rewrite JS Asset URLs: ${REWRITE_JS_ASSET_URLS}, Wait Time: ${WAIT_FOR_DYNAMIC_CONTENT}ms`);
+            log.info(`[Config Loaded] Evaluate HTML: ${EVALUATE_HTML}, Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Combine Styles: ${COMBINE_ALL_STYLES}, Shadow Roots: ${USE_SHADOW_ROOTS}, Rewrite JS Asset URLs: ${REWRITE_JS_ASSET_URLS}, Wait Time: ${WAIT_FOR_DYNAMIC_CONTENT}ms, Replaces: ${ENABLE_REPLACES ? `on (js:${REPLACES_JS.length} css:${REPLACES_CSS.length} html:${REPLACES_HTML.length})` : 'off'}, Beautify HTML: ${BEAUTIFY_HTML}`);
         } catch (e) {
             log.error(`[Config Error] Could not read config.json: ${e.message}`);
         }
@@ -1940,7 +1987,64 @@ async function downloadPage() {
         }
     }
 
-    const optimizedHtml = $.html({ decodeEntities: false });
+    // Apply user-configured find/replace rules to every saved CSS/JS file,
+    // then to the final HTML markup. Controlled by a single ENABLE_REPLACES
+    // switch so the arrays don't need to be emptied out to disable this.
+    if (ENABLE_REPLACES && REPLACES_CSS.length > 0 && savedCssFiles.size > 0) {
+        log.section(`Applying ${REPLACES_CSS.length} replace rule(s) to ${savedCssFiles.size} CSS file(s)`);
+        const replaceCssBar = createProgressBar('CSS replaces', savedCssFiles.size);
+        for (const cssFile of savedCssFiles) {
+            replaceCssBar.step(path.basename(cssFile.localPath));
+            if (!fs.existsSync(cssFile.localPath)) continue;
+            try {
+                let content = fs.readFileSync(cssFile.localPath, 'utf-8');
+                content = applyTextReplaces(content, REPLACES_CSS, cssFile.localPath);
+                fs.writeFileSync(cssFile.localPath, content, 'utf-8');
+            } catch (e) {
+                log.error(`CSS replace failed: ${cssFile.localPath} - ${e.message}`);
+            }
+        }
+        replaceCssBar.stop();
+    }
+
+    if (ENABLE_REPLACES && REPLACES_JS.length > 0 && savedJsFiles.size > 0) {
+        log.section(`Applying ${REPLACES_JS.length} replace rule(s) to ${savedJsFiles.size} JS file(s)`);
+        const replaceJsBar = createProgressBar('JS replaces', savedJsFiles.size);
+        for (const jsFile of savedJsFiles) {
+            replaceJsBar.step(path.basename(jsFile.localPath));
+            if (!fs.existsSync(jsFile.localPath)) continue;
+            try {
+                let content = fs.readFileSync(jsFile.localPath, 'utf-8');
+                content = applyTextReplaces(content, REPLACES_JS, jsFile.localPath);
+                fs.writeFileSync(jsFile.localPath, content, 'utf-8');
+            } catch (e) {
+                log.error(`JS replace failed: ${jsFile.localPath} - ${e.message}`);
+            }
+        }
+        replaceJsBar.stop();
+    }
+
+    let optimizedHtml = $.html({ decodeEntities: false });
+
+    if (ENABLE_REPLACES && REPLACES_HTML.length > 0) {
+        log.section(`Applying ${REPLACES_HTML.length} replace rule(s) to index.html`);
+        optimizedHtml = applyTextReplaces(optimizedHtml, REPLACES_HTML, 'index.html');
+    }
+
+    if (BEAUTIFY_HTML) {
+        log.info("Beautifying index.html...");
+        try {
+            optimizedHtml = beautify.html(optimizedHtml, {
+                indent_size: 2,
+                wrap_line_length: 0,
+                preserve_newlines: true,
+                max_preserve_newlines: 1,
+                end_with_newline: true
+            });
+        } catch (e) {
+            log.error(`HTML beautify failed, keeping unformatted output: ${e.message}`);
+        }
+    }
 
     log.info("\nSaving index.html layout file...");
     const rootHtmlPath = path.join(OUTPUT_DIR, 'index.html');
@@ -1987,43 +2091,44 @@ async function downloadPage() {
     log.success(`Successfully downloaded: ${downloadStats.downloaded}`);
     (downloadStats.failed > 0 ? log.warn : log.info)(`Failed downloads: ${downloadStats.failed}`);
     log.info(`Skipped (ignored patterns): ${downloadStats.skipped}`);
-    
-    if (downloadStats.missingFiles.size > 0) {
-        log.section('MISSING FILES (404 or download errors)');
-        const missingArray = Array.from(downloadStats.missingFiles);
-        const fonts = missingArray.filter(url => url.match(/\.(woff2?|ttf|otf|eot)$/i));
-        const images = missingArray.filter(url => url.match(/\.(jpg|jpeg|png|gif|webp|svg|ico)$/i));
-        const css = missingArray.filter(url => url.match(/\.css$/i));
-        const js = missingArray.filter(url => url.match(/\.js$/i));
-        const other = missingArray.filter(url => 
-            !fonts.includes(url) && !images.includes(url) && !css.includes(url) && !js.includes(url)
-        );
 
-        const printGroup = (label, urls) => {
-            if (urls.length === 0) return;
-            log.warn(`  ${label} (${urls.length}):`);
-            urls.slice(0, 5).forEach(url => log.dim(`    - ${url}`));
-            if (urls.length > 5) log.dim(`    ... and ${urls.length - 5} more`);
-        };
+    // if (downloadStats.missingFiles.size > 0) {
+    //     log.section('MISSING FILES (404 or download errors)');
+    //     const missingArray = Array.from(downloadStats.missingFiles);
+    //     const fonts = missingArray.filter(url => url.match(/\.(woff2?|ttf|otf|eot)$/i));
+    //     const images = missingArray.filter(url => url.match(/\.(jpg|jpeg|png|gif|webp|svg|ico)$/i));
+    //     const css = missingArray.filter(url => url.match(/\.css$/i));
+    //     const js = missingArray.filter(url => url.match(/\.js$/i));
+    //     const other = missingArray.filter(url => 
+    //         !fonts.includes(url) && !images.includes(url) && !css.includes(url) && !js.includes(url)
+    //     );
 
-        printGroup('Fonts', fonts);
-        printGroup('Images', images);
-        printGroup('CSS', css);
-        printGroup('JavaScript', js);
-        printGroup('Other', other);
-    }
+    //     const printGroup = (label, urls) => {
+    //         if (urls.length === 0) return;
+    //         log.warn(`  ${label} (${urls.length}):`);
+    //         urls.slice(0, 5).forEach(url => log.dim(`    - ${url}`));
+    //         if (urls.length > 5) log.dim(`    ... and ${urls.length - 5} more`);
+    //     };
+
+    //     printGroup('Fonts', fonts);
+    //     printGroup('Images', images);
+    //     printGroup('CSS', css);
+    //     printGroup('JavaScript', js);
+    //     printGroup('Other', other);
+    // }
     
-    if (downloadStats.errors.length > 0) {
-        log.section('ERROR LOG (first 10)');
-        downloadStats.errors.slice(0, 10).forEach(error => log.dim(`  - ${error}`));
-        if (downloadStats.errors.length > 10) {
-            log.dim(`  ... and ${downloadStats.errors.length - 10} more errors`);
-        }
-    }
+    // if (downloadStats.errors.length > 0) {
+    //     log.section('ERROR LOG (first 10)');
+    //     downloadStats.errors.slice(0, 10).forEach(error => log.dim(`  - ${error}`));
+    //     if (downloadStats.errors.length > 10) {
+    //         log.dim(`  ... and ${downloadStats.errors.length - 10} more errors`);
+    //     }
+    // }
 
     log.info('============================================');
     log.success(`Finished! Saved output path: ${rootHtmlPath}`);
     log.info(`Output directory: ${OUTPUT_DIR}`);
+    log.info(`Error log: errorlog.txt`);
     log.info('============================================');
 
 }
