@@ -7,9 +7,28 @@ import { dirname } from 'path';
 import * as cheerio from 'cheerio';
 import beautify from 'js-beautify';
 import { log, askUrl, askText, askYesNo, createProgressBar, createPercentBar, createDownloadStatus, exitCleanly } from './terminal-ui.js';
+import { parseArgs } from 'node:util';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+// Command line arguments:
+//   node downloader.js --config <config url> --url <url> --dir <output dir>
+// If --url / --dir are provided, the corresponding interactive prompt is skipped.
+// If --config is provided, the config is fetched from that URL instead of
+// being read from the local config.json file.
+const { values: cliArgs } = parseArgs({
+    options: {
+        config: { type: 'string' },
+        url: { type: 'string' },
+        dir: { type: 'string' }
+    },
+    strict: false
+});
+
+const CLI_CONFIG_URL = cliArgs.config || '';
+const CLI_TARGET_URL = cliArgs.url || '';
+const CLI_OUTPUT_DIR = cliArgs.dir || '';
 
 const MIME_TO_EXTENSION = {
     'image/jpeg': '.jpg',
@@ -51,6 +70,7 @@ let OUTPUT_DIR = '';
 let configData;
 let FLATTEN_ASSETS = false;
 let REMOVE_ALL_SCRIPTS = false;
+let USER_SCRIPT_BLOCKER = false;
 let STRIP_SRCSETS = true;
 let DISABLE_STRIPPED_ATTRIBUTES = false;
 let COMMENT_STRIPPED_TAGS = false;
@@ -59,6 +79,7 @@ let USE_SHADOW_ROOTS = false;
 let REWRITE_JS_ASSET_URLS = true;
 let WAIT_FOR_DYNAMIC_CONTENT = 5000; // Default wait time in ms
 let ERROR_LOG_PATH = '';
+let EVALUATE_HTML = true;
 
 let strippedTags = [];
 let strippedAttributes = [];
@@ -680,13 +701,18 @@ async function collectAllStylesAsHTML(page) {
             if (href && href.startsWith('http')) {
                 fetchPromises.push(
                     fetch(href)
-                        .then(response => response.text())
+                        .then(response => {
+                            if (!response.ok) {
+                                throw new Error(`HTTP ${response.status} ${response.statusText}`);
+                            }
+                            return response.text();
+                        })
                         .then(css => {
                             allCSS += `/* External: ${href} */\n`;
                             allCSS += css + '\n\n';
                         })
-                        .catch(() => {
-                            allCSS += `/* Could not fetch: ${href} (CORS or network error) */\n\n`;
+                        .catch((err) => {
+                            allCSS += `/* Could not fetch: ${href} (${err && err.message ? err.message : 'CORS or network error'}) */\n\n`;
                         })
                 );
             }
@@ -985,18 +1011,26 @@ async function waitForDynamicContent(page, timeout = 10000) {
 async function mainPrompts() {
     log.title('Website Downloader');
 
-    TARGET_URL = await askUrl('Enter website URL: ');
+    TARGET_URL = CLI_TARGET_URL || await askUrl('Enter website URL: ');
+    if (CLI_TARGET_URL) {
+        log.info(`Using URL from --url: ${TARGET_URL}`);
+    }
 
-    const defaultFolderName = getDomain(TARGET_URL);
-    const folderName = (await askText('Enter output folder name: ', defaultFolderName)) || defaultFolderName;
-    OUTPUT_DIR = path.join(__dirname, 'downloaded_site', folderName);
+    if (CLI_OUTPUT_DIR) {
+        OUTPUT_DIR = path.resolve(CLI_OUTPUT_DIR);
+        log.info(`Using output dir from --dir: ${OUTPUT_DIR}`);
+    } else {
+        const defaultFolderName = getDomain(TARGET_URL);
+        const folderName = (await askText('Enter output folder name: ', defaultFolderName)) || defaultFolderName;
+        OUTPUT_DIR = path.join(__dirname, 'downloaded_site', folderName);
+    }
     ERROR_LOG_PATH = path.join(OUTPUT_DIR, 'errorlog.txt');
 
     if (fs.existsSync(OUTPUT_DIR)) {
         const files = fs.readdirSync(OUTPUT_DIR);
         if (files.length > 0) {
             const shouldEmpty = await askYesNo(
-                `Warning: the folder "${folderName}" already contains files. Empty it first?`,
+                `Warning: the folder "${path.basename(OUTPUT_DIR)}" already contains files. Empty it first?`,
                 false
             );
             if (shouldEmpty) {
@@ -1081,59 +1115,94 @@ function writeErrorLog() {
     }
 }
 
-async function downloadPage() {
-    let EVALUATE_HTML = true;
+function applyConfigData(data) {
+    if (data.useViewports && Array.isArray(data.useViewports)) {
+        VIEWPORTS = data.useViewports;
+    }
+    if (typeof data.flattenAssets === 'boolean') FLATTEN_ASSETS = data.flattenAssets;
+    if (typeof data.removeAllScripts === 'boolean') REMOVE_ALL_SCRIPTS = data.removeAllScripts;
+    if (typeof data.evaluateHTML === 'boolean') EVALUATE_HTML = data.evaluateHTML;
+    if (typeof data.commentStrippedTags === 'boolean') COMMENT_STRIPPED_TAGS = data.commentStrippedTags;
+    if (data.strippedTags && Array.isArray(data.strippedTags)) {
+        strippedTags = data.strippedTags;
+    }
+    if (typeof data.disableStrippedAttributes === 'boolean') DISABLE_STRIPPED_ATTRIBUTES = data.disableStrippedAttributes;
+    if (data.strippedAttributes && Array.isArray(data.strippedAttributes)) {
+        strippedAttributes = data.strippedAttributes;
+    }
+    if (strippedAttributes.includes("srcset")) STRIP_SRCSETS = true;
+    if (typeof data.combineAllStyles === 'boolean') COMBINE_ALL_STYLES = data.combineAllStyles;
+    if (typeof data.useShadowRoots === 'boolean') USE_SHADOW_ROOTS = data.useShadowRoots;
+    if (typeof data.rewriteAssetUrlsInJs === 'boolean') REWRITE_JS_ASSET_URLS = data.rewriteAssetUrlsInJs;
+    if (data.waitForDynamicContent) {
+        WAIT_FOR_DYNAMIC_CONTENT = data.waitForDynamicContent;
+    }
+
+    if (data.excludeScripts && Array.isArray(data.excludeScripts)) {
+        excludedScriptPatterns = data.excludeScripts.map(pattern => wildcardToRegex(pattern));
+    }
+    if (data.ignoredSources && Array.isArray(data.ignoredSources)) {
+        ignoredPatterns = data.ignoredSources.map(pattern => wildcardToRegex(pattern));
+    }
+    if (typeof data.useScriptBlocker === 'boolean') USER_SCRIPT_BLOCKER = data.useScriptBlocker;
+
+    if (data.embedStyleHead) EMBED_STYLE_HEAD = data.embedStyleHead;
+    if (data.embedScriptHead) EMBED_SCRIPT_HEAD = data.embedScriptHead;
+    if (data.embedScriptBodyEnd) EMBED_SCRIPT_BODY_END = data.embedScriptBodyEnd;
+
+    if (typeof data.enableReplaces === 'boolean') ENABLE_REPLACES = data.enableReplaces;
+    if (data.replacesJs && Array.isArray(data.replacesJs)) REPLACES_JS = data.replacesJs;
+    if (data.replacesCss && Array.isArray(data.replacesCss)) REPLACES_CSS = data.replacesCss;
+    if (data.replacesHtml && Array.isArray(data.replacesHtml)) REPLACES_HTML = data.replacesHtml;
+    if (typeof data.beautifyHtml === 'boolean') BEAUTIFY_HTML = data.beautifyHtml;
+
+    log.info(`[Config Loaded] Evaluate HTML: ${EVALUATE_HTML}, Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Use Script Blocker: ${USER_SCRIPT_BLOCKER}, Combine Styles: ${COMBINE_ALL_STYLES}, Shadow Roots: ${USE_SHADOW_ROOTS}, Rewrite JS Asset URLs: ${REWRITE_JS_ASSET_URLS}, Wait Time: ${WAIT_FOR_DYNAMIC_CONTENT}ms, Replaces: ${ENABLE_REPLACES ? `on (js:${REPLACES_JS.length} css:${REPLACES_CSS.length} html:${REPLACES_HTML.length})` : 'off'}, Beautify HTML: ${BEAUTIFY_HTML}`);
+}
+
+async function loadConfig() {
+    if (CLI_CONFIG_URL) {
+        const isRemote = /^https?:\/\//i.test(CLI_CONFIG_URL);
+
+        if (isRemote) {
+            try {
+                log.info(`[Config] Fetching config from ${CLI_CONFIG_URL} ...`);
+                const response = await fetch(CLI_CONFIG_URL);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status} ${response.statusText}`);
+                }
+                configData = await response.json();
+                applyConfigData(configData);
+            } catch (e) {
+                log.error(`[Config Error] Could not fetch config from ${CLI_CONFIG_URL}: ${e.message}`);
+            }
+        } else {
+            // Treat --config as a local file path (relative paths are
+            // resolved against the current working directory).
+            const configPath = path.resolve(process.cwd(), CLI_CONFIG_URL);
+            try {
+                log.info(`[Config] Reading config from ${configPath} ...`);
+                configData = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+                applyConfigData(configData);
+            } catch (e) {
+                log.error(`[Config Error] Could not read config from ${configPath}: ${e.message}`);
+            }
+        }
+        return;
+    }
 
     const configPath = path.join(__dirname, 'config.json');
-
     if (fs.existsSync(configPath)) {
         try {
             configData = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-            
-            if (configData.useViewports && Array.isArray(configData.useViewports)) {
-                VIEWPORTS = configData.useViewports;
-            }
-            if (typeof configData.flattenAssets === 'boolean') FLATTEN_ASSETS = configData.flattenAssets;
-            if (typeof configData.removeAllScripts === 'boolean') REMOVE_ALL_SCRIPTS = configData.removeAllScripts;
-            if (typeof configData.evaluateHTML === 'boolean') EVALUATE_HTML = configData.evaluateHTML;
-            if (typeof configData.commentStrippedTags === 'boolean') COMMENT_STRIPPED_TAGS = configData.commentStrippedTags;
-            if (configData.strippedTags && Array.isArray(configData.strippedTags)) {
-                strippedTags = configData.strippedTags;
-            }
-            if (typeof configData.disableStrippedAttributes === 'boolean') DISABLE_STRIPPED_ATTRIBUTES = configData.disableStrippedAttributes;                  
-            if (configData.strippedAttributes && Array.isArray(configData.strippedAttributes)) {
-                strippedAttributes = configData.strippedAttributes;
-            }            
-            if (strippedAttributes.includes("srcset")) STRIP_SRCSETS = true;
-            if (typeof configData.combineAllStyles === 'boolean') COMBINE_ALL_STYLES = configData.combineAllStyles;
-            if (typeof configData.useShadowRoots === 'boolean') USE_SHADOW_ROOTS = configData.useShadowRoots;
-            if (typeof configData.rewriteAssetUrlsInJs === 'boolean') REWRITE_JS_ASSET_URLS = configData.rewriteAssetUrlsInJs;
-            if (configData.waitForDynamicContent) {
-                WAIT_FOR_DYNAMIC_CONTENT = configData.waitForDynamicContent;
-            }
-
-            if (configData.excludeScripts && Array.isArray(configData.excludeScripts)) {
-                excludedScriptPatterns = configData.excludeScripts.map(pattern => wildcardToRegex(pattern));
-            }
-            if (configData.ignoredSources && Array.isArray(configData.ignoredSources)) {
-                ignoredPatterns = configData.ignoredSources.map(pattern => wildcardToRegex(pattern));
-            }
-
-            if (configData.embedStyleHead) EMBED_STYLE_HEAD = configData.embedStyleHead;
-            if (configData.embedScriptHead) EMBED_SCRIPT_HEAD = configData.embedScriptHead;
-            if (configData.embedScriptBodyEnd) EMBED_SCRIPT_BODY_END = configData.embedScriptBodyEnd;
-
-            if (typeof configData.enableReplaces === 'boolean') ENABLE_REPLACES = configData.enableReplaces;
-            if (configData.replacesJs && Array.isArray(configData.replacesJs)) REPLACES_JS = configData.replacesJs;
-            if (configData.replacesCss && Array.isArray(configData.replacesCss)) REPLACES_CSS = configData.replacesCss;
-            if (configData.replacesHtml && Array.isArray(configData.replacesHtml)) REPLACES_HTML = configData.replacesHtml;
-            if (typeof configData.beautifyHtml === 'boolean') BEAUTIFY_HTML = configData.beautifyHtml;
-            
-            log.info(`[Config Loaded] Evaluate HTML: ${EVALUATE_HTML}, Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Combine Styles: ${COMBINE_ALL_STYLES}, Shadow Roots: ${USE_SHADOW_ROOTS}, Rewrite JS Asset URLs: ${REWRITE_JS_ASSET_URLS}, Wait Time: ${WAIT_FOR_DYNAMIC_CONTENT}ms, Replaces: ${ENABLE_REPLACES ? `on (js:${REPLACES_JS.length} css:${REPLACES_CSS.length} html:${REPLACES_HTML.length})` : 'off'}, Beautify HTML: ${BEAUTIFY_HTML}`);
+            applyConfigData(configData);
         } catch (e) {
             log.error(`[Config Error] Could not read config.json: ${e.message}`);
         }
     }
+}
+
+async function downloadPage() {
+    await loadConfig();
 
     const browser = await puppeteer.launch({ 
         headless: true,
@@ -1214,6 +1283,32 @@ async function downloadPage() {
         timeout: 60000 
     });
 
+    // Use the final navigated URL (after any server redirects, e.g.
+    // "/downloader-test" -> "/downloader-test/") as the base for
+    // resolving every relative asset URL on the page. Without this,
+    // resolving "bg.png" against a base of ".../downloader-test" (no
+    // trailing slash) treats "downloader-test" as a file per the URL
+    // spec, and incorrectly resolves siblings against the parent
+    // directory instead (".../bg.png" instead of
+    // ".../downloader-test/bg.png").
+    let navigatedUrl = page.url() || TARGET_URL;
+    try {
+        const parsedNavigated = new URL(navigatedUrl);
+        const lastSegment = parsedNavigated.pathname.split('/').pop();
+        // If the path doesn't end in a slash and the last segment has no
+        // file extension, it's a directory served without a redirect -
+        // treat it as one so relative URLs resolve correctly.
+        if (lastSegment && !path.extname(lastSegment) && !parsedNavigated.pathname.endsWith('/')) {
+            parsedNavigated.pathname += '/';
+            navigatedUrl = parsedNavigated.href;
+        }
+    } catch (e) {}
+
+    if (navigatedUrl !== TARGET_URL) {
+        log.info(`Resolved base URL for relative assets: ${navigatedUrl}`);
+        TARGET_URL = navigatedUrl;
+    }
+
     let finalHtml;
 
     if (EVALUATE_HTML) {
@@ -1240,7 +1335,8 @@ async function downloadPage() {
             });
             
             // Scroll to load lazy content
-            await autoScroll(page, `Scrolling layout (${vp.name})`);
+            // await autoScroll(page, `Scrolling layout (${vp.name})`);
+            await autoScroll(page, 'Scrolling layout');
             
             // Wait a bit for layout to settle
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -1703,7 +1799,7 @@ async function downloadPage() {
             })();
         </script>`;
 
-        $('head').prepend(dynamicBlockerScript);
+        if (USER_SCRIPT_BLOCKER) $('head').prepend(dynamicBlockerScript);
     }
 
     log.info("\nStripping tags: " + strippedTags.join(", ") + (COMMENT_STRIPPED_TAGS ? ' (comment mode) ' : ''));
@@ -1916,22 +2012,39 @@ async function downloadPage() {
                 const registryKey = cleanUrlKey(absoluteUrl);
                 let knownContentType = urlContentTypeMap.get(registryKey) || '';
 
-                if (!knownContentType && ['img', 'source', 'link', 'script'].includes(el.name)) {
+                // knownContentType can legitimately be an empty string for a
+                // successful download (e.g. server sent no content-type
+                // header), so use "is the file actually on disk" as the
+                // source of truth for whether this asset is available
+                // locally, rather than relying on knownContentType alone.
+                let assetLocalPath = urlToLocalPath(absoluteUrl, knownContentType);
+                let assetAvailable = !!assetLocalPath && fs.existsSync(assetLocalPath);
+
+                if (!assetAvailable && ['img', 'source', 'link', 'script'].includes(el.name)) {
                     const localPath = urlToLocalPath(absoluteUrl);
                     if (localPath) {
                         const result = await safeDownload(absoluteUrl, localPath);
                         if (result.success) {
                             knownContentType = result.contentType;
                             urlContentTypeMap.set(registryKey, knownContentType);
+                            assetLocalPath = localPath;
+                            assetAvailable = true;
                         }
                     }
                 }
 
-                const localRelativePath = getOrCreateAssetPath(
-                    absoluteUrl,
-                    knownContentType
-                );
-                element.attr(attr, localRelativePath);
+                if (assetAvailable) {
+                    const localRelativePath = getOrCreateAssetPath(
+                        absoluteUrl,
+                        knownContentType
+                    );
+                    element.attr(attr, localRelativePath);
+                } else {
+                    // Download failed (404, network error, etc.) - keep the
+                    // original absolute URL instead of pointing at a local
+                    // file that was never written.
+                    element.attr(attr, absoluteUrl);
+                }
             } catch (e) {}
         }
     }
@@ -1962,23 +2075,32 @@ async function downloadPage() {
                 const registryKey = cleanUrlKey(absoluteUrl);
                 let knownContentType = urlContentTypeMap.get(registryKey) || '';
 
-                if (!knownContentType) {
+                let assetLocalPath = urlToLocalPath(absoluteUrl, knownContentType);
+                let assetAvailable = !!assetLocalPath && fs.existsSync(assetLocalPath);
+
+                if (!assetAvailable) {
                     const localPath = urlToLocalPath(absoluteUrl);
                     if (localPath) {
                         const result = await safeDownload(absoluteUrl, localPath);
                         if (result.success) {
                             knownContentType = result.contentType;
                             urlContentTypeMap.set(registryKey, knownContentType);
+                            assetAvailable = true;
                         }
                     }
                 }
 
-                const localRelativePath = getOrCreateAssetPath(
-                    absoluteUrl,
-                    knownContentType
-                );
-                content = content.split(originalUrl).join(localRelativePath);
-                modified = true;
+                if (assetAvailable) {
+                    const localRelativePath = getOrCreateAssetPath(
+                        absoluteUrl,
+                        knownContentType
+                    );
+                    content = content.split(originalUrl).join(localRelativePath);
+                    modified = true;
+                }
+                // If the download failed, leave the original URL text in
+                // the inline script untouched rather than pointing it at a
+                // local file that doesn't exist.
             } catch (e) {}
         }
 

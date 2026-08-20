@@ -34,9 +34,14 @@ term.on('key', (name) => {
 /* ------------------------------------------------------------------ */
 
 // Every log function returns to a fresh line first, in case a progress
-// bar or status line is currently occupying the current line.
+// bar or status line is currently occupying the current line. It also
+// erases anything left over on that line (e.g. a longer status line
+// like "Downloading assets ... (total seen: 3)"), otherwise leftover
+// characters from the old line can remain visible after shorter text
+// is written on top of it.
 function freshLine() {
     term.column(1);
+    term.eraseLineAfter();
 }
 
 const log = {
@@ -170,7 +175,7 @@ function createProgressBar(title, total) {
     freshLine();
     let current = 0;
     const controller = term.progressBar({
-        width: 60,
+        width: 100,
         title,
         eta: true,
         percent: true,
@@ -184,6 +189,13 @@ function createProgressBar(title, total) {
             controller.itemDone(label || `${current}/${total}`);
         },
         stop() {
+            // terminal-kit throttles/coalesces progress-bar redraws, so a
+            // loop that finishes very quickly (few items, short delays)
+            // can call step() a couple of times and then stop() before
+            // the bar has ever actually repainted past its initial 0%
+            // frame. Force a final full-bar render before stopping so we
+            // never commit a half-drawn frame to the terminal history.
+            try { controller.update(1); } catch (e) {}
             controller.stop();
             term('\n');
         }
@@ -243,6 +255,10 @@ function createPercentBar(title) {
             controller.update(Math.max(0, Math.min(1, fraction)));
         },
         stop() {
+            // Same throttled-redraw safety net as createProgressBar: make
+            // sure the bar has actually rendered its 100% frame before
+            // committing the line with a trailing newline.
+            try { controller.update(1); } catch (e) {}
             controller.stop();
             term('\n');
         }

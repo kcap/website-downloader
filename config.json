@@ -33,7 +33,7 @@
     "strippedTags": ["base", "iframe", "noscript", "*[id='exampleToStrip']", "*link[rel='preconnect']", "*link[rel='alternate']"],
     "commentStrippedTags": false,
     "removeAllScripts": false,
-    "combineAllStyles": false,
+    "combineAllStyles": true,
     "excludeScripts": [
         "gtag.js",
         "*gtm.js*",
@@ -44,6 +44,7 @@
         "*yandex.ru*",
         "*vk.com*"
     ],
+    "useScriptBlocker": false,
     "ignoredSources": [
         "*fonts.googleapis.com*",
         "*fonts.gstatic.com*",
@@ -57,7 +58,7 @@
     "replacesJs": [],
     "replacesCss": [],
     "replacesHtml": [
-        { "find": "OLD_API_URL", "replace": "https://api.example.com" }
+        { "find": "{find}", "replace": "{replace}" }
     ],
 
     "beautifyHtml": true
