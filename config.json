@@ -23,17 +23,17 @@
         "height": 812,
         "isMobile": true,
         "hasTouch": true,
-        "use": true
+        "use": false
     }],
-    "waitForDynamicContent": 4000,
+    "waitForDynamicContent": 10000,
     "flattenAssets": true,
     "rewriteAssetUrlsInJs": false,
     "strippedAttributes": ["srcset", "integrity"],
     "disableStrippedAttributes": false,
     "strippedTags": ["base", "iframe", "noscript", "*[id='exampleToStrip']", "*link[rel='preconnect']", "*link[rel='alternate']"],
     "commentStrippedTags": false,
-    "removeAllScripts": false,
-    "combineAllStyles": true,
+    "removeAllScripts": true,
+    "combineAllStyles": false,
     "excludeScripts": [
         "gtag.js",
         "*gtm.js*",
