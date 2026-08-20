@@ -442,35 +442,6 @@ function getOrCreateAssetPath(assetUrl, contentType = '') {
     }
 }
 
-async function autoScroll(page, label = 'Scrolling page') {
-    const distance = 150;
-    const maxHeight = 25000;
-    const stepDelay = 256;
-    let totalHeight = 0;
-
-    const bar = createPercentBar(label);
-
-    try {
-        while (true) {
-            const scrollHeight = await page.evaluate((d) => {
-                window.scrollBy(0, d);
-                return document.body.scrollHeight;
-            }, distance);
-
-            totalHeight += distance;
-            const target = Math.min(scrollHeight, maxHeight) || 1;
-            bar.update(totalHeight / target);
-
-            if (totalHeight >= scrollHeight || totalHeight > maxHeight) break;
-
-            await new Promise(resolve => setTimeout(resolve, stepDelay));
-        }
-    } finally {
-        bar.update(1);
-        bar.stop();
-    }
-}
-
 function rewriteCssUrls(cssText, baseUrl) {
     const cssUrlRegex = /url\(['"]?([^'")]+)['"]?\)/g;
 
@@ -943,111 +914,54 @@ async function safeDownload(url, localPath, contentType = '') {
     }
 }
 
-// Simplified wait for dynamic content - just wait for network idle and stability
-// async function waitForDynamicContent(page, timeout = 10000) {
-//     log.info(`Waiting ${timeout/1000}s for dynamic content to load...`);
-    
-//     const startTime = Date.now();
-//     let lastHTML = '';
-//     let stableChecks = 0;
-//     const requiredStableChecks = 3;
-//     const checkInterval = 500; // Check every 500ms
-    
-//     // First, wait for any pending network requests to complete
-//     await page.waitForNetworkIdle({ 
-//         idleTime: 2000, 
-//         timeout: timeout 
-//     }).catch(() => {
-//         log.info(`Network idle timeout reached, continuing...`);
-//     });
-    
-//     // Then wait for the DOM to become stable (not changing)
-//     while (Date.now() - startTime < timeout) {
-//         const currentHTML = await page.evaluate(() => document.documentElement.outerHTML);
-        
-//         if (currentHTML === lastHTML) {
-//             stableChecks++;
-//         } else {
-//             stableChecks = 0;
-//             lastHTML = currentHTML;
-//         }
-        
-//         // If HTML is stable for required checks, break
-//         if (stableChecks >= requiredStableChecks) {
-//             log.success(`Page HTML stable after ${Math.round((Date.now() - startTime)/1000)}s`);
-//             break;
-//         }
-        
-//         await new Promise(resolve => setTimeout(resolve, checkInterval));
-//     }
-    
-//     // Additional wait for any lazy-loaded content to appear
-//     {
-//         const maxScrolls = 3;
-//         let lastHeight = await page.evaluate(() => document.body.scrollHeight);
-//         const bar = createProgressBar('Triggering lazy-load scroll', maxScrolls);
+async function autoScroll(page, label = 'Scrolling page') {
+    const distance = 150;
+    const maxHeight = 25000;
+    const stepDelay = 256;
+    let totalHeight = 0;
 
-//         for (let i = 0; i < maxScrolls; i++) {
-//             await page.evaluate(() => window.scrollBy(0, 500));
-//             await new Promise(resolve => setTimeout(resolve, 300));
+    const bar = createPercentBar(label);
 
-//             const newHeight = await page.evaluate(() => document.body.scrollHeight);
-//             bar.step(`pass ${i + 1}/${maxScrolls}`);
+    try {
+        while (true) {
+            const scrollHeight = await page.evaluate((d) => {
+                window.scrollBy(0, d);
+                return document.body.scrollHeight;
+            }, distance);
 
-//             if (newHeight === lastHeight) break;
-//             lastHeight = newHeight;
-//         }
+            totalHeight += distance;
+            const target = Math.min(scrollHeight, maxHeight) || 1;
+            bar.update(totalHeight / target);
 
-//         await page.evaluate(() => window.scrollTo(0, 0));
-//         bar.stop();
-//     }
-    
-//     // Final small delay for any post-scroll rendering
-//     await new Promise(resolve => setTimeout(resolve, 1000));
-    
-//     log.info(`Total wait time: ${Math.round((Date.now() - startTime)/1000)}s`);
-// }
+            if (totalHeight >= scrollHeight || totalHeight > maxHeight) break;
+
+            await new Promise(resolve => setTimeout(resolve, stepDelay));
+        }
+    } finally {
+        bar.update(1);
+        bar.stop();
+    }
+}
+
 
 async function waitForDynamicContent(page, timeout = 20000) {
     log.info(`Waiting for generic dynamic content...`);
     const startTime = Date.now();
 
-    // 1. Initial network idle wait for basic JS/framework hydration
-    await page.waitForNetworkIdle({ idleTime: 1000, timeout: 5000 }).catch(() => {});
-
-    // 2. Full page auto-scroll to trigger all scroll-based dynamic loads
-    await page.evaluate(async () => {
-        await new Promise((resolve) => {
-            let totalHeight = 0;
-            const distance = 300;
-            const timer = setInterval(() => {
-                const scrollHeight = document.body.scrollHeight;
-                window.scrollBy(0, distance);
-                totalHeight += distance;
-
-                // Stop when reaching the actual bottom or safety limit
-                if (totalHeight >= scrollHeight || totalHeight > 15000) {
-                    clearInterval(timer);
-                    resolve();
-                }
-            }, 100);
-        });
-    });
-
-    // 3. Scroll back to top (resets headers/sticky navigation)
-    await page.evaluate(() => window.scrollTo(0, 0));
-
-    // 4. Wait for post-scroll network idle (captures requests triggered by scrolling)
     await page.waitForNetworkIdle({ idleTime: 1500, timeout: 5000 }).catch(() => {});
 
-    // 5. DOM Node Count Stability Check
+    // Call autoScroll directly as a Node.js function, passing the page instance
+    await autoScroll(page);
+
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForNetworkIdle({ idleTime: 1500, timeout: 5000 }).catch(() => {});
+
     let lastNodeCount = 0;
     let stableChecks = 0;
     const requiredChecks = 3;
     const checkInterval = 500;
 
     while (Date.now() - startTime < timeout) {
-        // Counting DOM elements is much faster and lighter than outerHTML string comparison
         const currentNodeCount = await page.evaluate(() => document.querySelectorAll('*').length);
 
         if (currentNodeCount === lastNodeCount && currentNodeCount > 0) {
@@ -1057,9 +971,7 @@ async function waitForDynamicContent(page, timeout = 20000) {
             lastNodeCount = currentNodeCount;
         }
 
-        if (stableChecks >= requiredChecks) {
-            break;
-        }
+        if (stableChecks >= requiredChecks) break;
 
         await new Promise(resolve => setTimeout(resolve, checkInterval));
     }

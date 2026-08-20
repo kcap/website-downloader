@@ -86,7 +86,7 @@ const log = {
     title(msg = '') {
         freshLine();
         term('\n');
-        term.bgCyan.black.bold(`  ${msg}  `)('\n');
+        term.bgGreen.bold(`  ${msg}  `)('\n');
     }
 };
 
