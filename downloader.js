@@ -12,6 +12,86 @@ import { parseArgs } from 'node:util';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+/** example config: 
+ * 
+{
+    "evaluateHTML": true,
+    "useShadowRoots": false,
+    "useViewports": [
+    {
+        "name": "Desktop",
+        "width": 1280,
+        "height": 800,
+        "isMobile": false,
+        "use": true
+    },
+    {
+        "name": "Tablet",
+        "width": 768,
+        "height": 1024,
+        "isMobile": true,
+        "hasTouch": true,
+        "use": false
+    },
+    {
+        "name": "Mobile",
+        "width": 375,
+        "height": 812,
+        "isMobile": true,
+        "hasTouch": true,
+        "use": false
+    }],
+    "waitForDynamicContent": 10000,
+    "flattenAssets": true,
+    "rewriteAssetUrlsInJs": false,
+    "strippedAttributes": ["srcset", "integrity"],
+    "disableStrippedAttributes": false,
+    "strippedTags": [
+        "base",
+        "iframe",
+        "noscript",
+        "link[rel='preload']",
+        "link[rel='preconnect']",
+        "link[rel='alternate']",
+        "link[rel='manifest']"
+    ],
+    "commentStrippedTags": false,
+    "removeAllScripts": true,
+    "combineAllStyles": false,
+    "excludeScripts": [
+        "gtag.js",
+        "*gtm.js*",
+        "*tagmanager*",
+        "analytics.js",
+        "cookiebot",
+        "facebook.net",
+        "*yandex.ru*",
+        "*vk.com*"
+    ],
+    "useScriptBlocker": false,
+    "ignoredSources": [
+        "*fonts.googleapis.com*",
+        "*fonts.gstatic.com*",
+        "*youtube.com*"
+    ],
+    "embedStyleHead": false,
+    "embedScriptHead": false,
+    "embedScriptBodyEnd": false,
+
+    "enableReplaces": true,
+    "replacesJs": [],
+    "replacesCss": [],
+    "replacesHtml": [
+    {
+        "find": "{find}",
+        "replace": "{replace}"
+    }],
+    "absolutizeRootRelativeLinks": true,
+    "beautifyHtml": true
+}
+*/
+
+
 // Command line arguments:
 //   node downloader.js --config <config url> --url <url> --dir <output dir>
 // If --url / --dir are provided, the corresponding interactive prompt is skipped.
@@ -1808,35 +1888,42 @@ async function downloadPage() {
     }
 
     log.info("\nStripping tags: " + strippedTags.join(", ") + (COMMENT_STRIPPED_TAGS ? ' (comment mode) ' : ''));
-    for(const tag of strippedTags) {
-        if (COMMENT_STRIPPED_TAGS) {
-            // Comment out the tag instead of removing it
-            $(`${tag}`).each(function() {
-                const $el = $(this);
-                const outerHtml = $el.prop('outerHTML');
-                // Replace with HTML comment
-                $el.replaceWith(`<!-- ${outerHtml} -->`);
-            });
-        } else {
-            // Remove tags normally
-            $(`${tag}`).remove();
-        }
+
+    if (COMMENT_STRIPPED_TAGS) {
+        // Single DOM selection pass for commenting
+        const combinedSelector = strippedTags.join(',');
+        $(combinedSelector).each(function() {
+            const $el = $(this);
+            $el.replaceWith(`<!-- ${$el.prop('outerHTML')} -->`);
+        });
+    } else {
+        // Single DOM selection pass for removal (Fastest)
+        $(strippedTags.join(',')).remove();
     }
 
     log.info("\nStripping attributes: " + strippedAttributes.join(", ") + (DISABLE_STRIPPED_ATTRIBUTES ? ' (disable mode) ' : ''));
-    for(const attr of strippedAttributes) {
+
+    if (strippedAttributes.length > 0) {
         if (DISABLE_STRIPPED_ATTRIBUTES) {
-            // Add prefix to disable the attribute instead of removing it
-            $(`*[${attr}]`).each(function() {
+            // Single DOM pass: match any element containing AT LEAST ONE of the target attributes
+            const selector = strippedAttributes.map(attr => `[${attr}]`).join(',');
+            
+            $(selector).each(function() {
                 const $el = $(this);
-                const value = $el.attr(attr);
-                $el.removeAttr(attr);
-                // Add disabled version with prefix
-                $el.attr(`__disabled__${attr}`, value || '');
+                
+                // Loop through attributes to process only the ones present on this specific element
+                for (const attr of strippedAttributes) {
+                    if ($el.attr(attr) !== undefined) {
+                        const value = $el.attr(attr);
+                        $el.removeAttr(attr);
+                        $el.attr(`__disabled__${attr}`, value || '');
+                    }
+                }
             });
         } else {
-            // Remove attributes normally
-            $(`*[${attr}]`).removeAttr(attr);
+            // Normal removal: batch remove in a single pass
+            const selector = strippedAttributes.map(attr => `[${attr}]`).join(',');
+            $(selector).removeAttr(strippedAttributes.join(' '));
         }
     }
 

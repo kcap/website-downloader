@@ -34,6 +34,9 @@
         "base",
         "iframe",
         "noscript",
+        "meta:not([name='viewport']):not([name='title']):not([name='description'])",
+        "link[rel='canonical']",
+        "link[rel='preload']",
         "link[rel='preconnect']",
         "link[rel='alternate']",
         "link[rel='manifest']"
