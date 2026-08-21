@@ -1362,7 +1362,7 @@ async function downloadPage() {
         }
     });
 
-    log.info(`\nNavigating to ${TARGET_URL}...`);
+    log.info(`Navigating to ${TARGET_URL}...`);
     const initialResponse = await page.goto(TARGET_URL, { 
         waitUntil: 'networkidle2', 
         timeout: 60000 
@@ -1403,7 +1403,7 @@ async function downloadPage() {
         // Now evaluate different viewports
         for (const vp of VIEWPORTS) {
             if (!vp.use) continue;
-            log.info(`\nEvaluating layout for ${vp.name} (${vp.width}x${vp.height})...`);
+            log.info(`Evaluating layout for ${vp.name} (${vp.width}x${vp.height})...`);
             await page.setViewport({ 
                 width: vp.width, 
                 height: vp.height, 
@@ -1431,7 +1431,7 @@ async function downloadPage() {
         await page.setViewport(VIEWPORTS[0]);
         await page.evaluate(() => window.scrollTo(0, 0));
 
-        log.info("\nCapturing fully evaluated HTML...");
+        log.info("Capturing fully evaluated HTML...");
         
         // One final check for stability
         await page.evaluate(() => {
@@ -1476,7 +1476,7 @@ async function downloadPage() {
 
     let rawCombinedCss = '';
         if (COMBINE_ALL_STYLES) {
-            log.info("\nCombining all page styles into a single stylesheet...");
+            log.info("Combining all page styles into a single stylesheet...");
             try {
                 rawCombinedCss = await collectAllStylesAsHTML(page);
             } catch (err) {
@@ -1798,7 +1798,7 @@ async function downloadPage() {
     }
 
     if (REMOVE_ALL_SCRIPTS) {
-        log.info("\nPurging ALL script tags from target HTML...");
+        log.info("Purging ALL script tags from target HTML...");
         $('script').remove();
         $('*').each((i, el) => {
             for (const attr in el.attribs) {
@@ -1887,7 +1887,7 @@ async function downloadPage() {
         if (USER_SCRIPT_BLOCKER) $('head').prepend(dynamicBlockerScript);
     }
 
-    log.info("\nStripping tags: " + strippedTags.join(", ") + (COMMENT_STRIPPED_TAGS ? ' (comment mode) ' : ''));
+    log.info("Stripping tags: " + strippedTags.join(", ") + (COMMENT_STRIPPED_TAGS ? ' (comment mode) ' : ''));
 
     if (COMMENT_STRIPPED_TAGS) {
         // Single DOM selection pass for commenting
@@ -1901,7 +1901,7 @@ async function downloadPage() {
         $(strippedTags.join(',')).remove();
     }
 
-    log.info("\nStripping attributes: " + strippedAttributes.join(", ") + (DISABLE_STRIPPED_ATTRIBUTES ? ' (disable mode) ' : ''));
+    log.info("Stripping attributes: " + strippedAttributes.join(", ") + (DISABLE_STRIPPED_ATTRIBUTES ? ' (disable mode) ' : ''));
 
     if (strippedAttributes.length > 0) {
         if (DISABLE_STRIPPED_ATTRIBUTES) {
@@ -1928,7 +1928,7 @@ async function downloadPage() {
     }
 
     if (!STRIP_SRCSETS) {
-        log.info("\nEvaluating and downloading responsive images (srcset)...");
+        log.info("Evaluating and downloading responsive images (srcset)...");
         const srcsetElements = $('*[srcset]').toArray();
         
         for (const el of srcsetElements) {
@@ -2303,7 +2303,7 @@ async function downloadPage() {
         }
     }
 
-    log.info("\nSaving index.html layout file...");
+    log.info("Saving index.html layout file...");
     const rootHtmlPath = path.join(OUTPUT_DIR, 'index.html');
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     fs.writeFileSync(rootHtmlPath, optimizedHtml, 'utf-8'); 
@@ -2392,43 +2392,9 @@ async function downloadPage() {
     (downloadStats.failed > 0 ? log.warn : log.info)(`Failed downloads: ${downloadStats.failed}`);
     log.info(`Skipped (ignored patterns): ${downloadStats.skipped}`);
 
-    // if (downloadStats.missingFiles.size > 0) {
-    //     log.section('MISSING FILES (404 or download errors)');
-    //     const missingArray = Array.from(downloadStats.missingFiles);
-    //     const fonts = missingArray.filter(url => url.match(/\.(woff2?|ttf|otf|eot)$/i));
-    //     const images = missingArray.filter(url => url.match(/\.(jpg|jpeg|png|gif|webp|svg|ico)$/i));
-    //     const css = missingArray.filter(url => url.match(/\.css$/i));
-    //     const js = missingArray.filter(url => url.match(/\.js$/i));
-    //     const other = missingArray.filter(url => 
-    //         !fonts.includes(url) && !images.includes(url) && !css.includes(url) && !js.includes(url)
-    //     );
-
-    //     const printGroup = (label, urls) => {
-    //         if (urls.length === 0) return;
-    //         log.warn(`  ${label} (${urls.length}):`);
-    //         urls.slice(0, 5).forEach(url => log.dim(`    - ${url}`));
-    //         if (urls.length > 5) log.dim(`    ... and ${urls.length - 5} more`);
-    //     };
-
-    //     printGroup('Fonts', fonts);
-    //     printGroup('Images', images);
-    //     printGroup('CSS', css);
-    //     printGroup('JavaScript', js);
-    //     printGroup('Other', other);
-    // }
-    
-    // if (downloadStats.errors.length > 0) {
-    //     log.section('ERROR LOG (first 10)');
-    //     downloadStats.errors.slice(0, 10).forEach(error => log.dim(`  - ${error}`));
-    //     if (downloadStats.errors.length > 10) {
-    //         log.dim(`  ... and ${downloadStats.errors.length - 10} more errors`);
-    //     }
-    // }
-
-    log.info('============================================');
+    log.info('\n============================================');
     log.success(`Finished! Saved output path: ${rootHtmlPath}`);
     log.info(`Output directory: ${OUTPUT_DIR}`);
-    log.info(`Error log: errorlog.txt`);
     log.info('============================================');
 
 }

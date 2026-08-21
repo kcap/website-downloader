@@ -78,14 +78,12 @@ const log = {
     // Section header, e.g. "--- Running asset link processing ---"
     section(msg = '') {
         freshLine();
-        term('\n');
-        term.cyan.bold(msg + '\n');
+        term.cyan.bold(' --- '+msg + ' ---\n');
     },
 
     // Big banner-style title
     title(msg = '') {
         freshLine();
-        term('\n');
         term.bgGreen.bold(`  ${msg}  `)('\n');
     }
 };
