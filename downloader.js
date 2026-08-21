@@ -2337,6 +2337,49 @@ async function downloadPage() {
         }
     }
 
+    // Text assets (index.html + saved/rewritten .css and .js files) get
+    // written in plain UTF-8 throughout the pipeline - downloaded bytes are
+    // saved as-is, and every rewrite step reads/writes with plain 'utf-8'.
+    // Pages containing Cyrillic (or other non-Latin) text need a UTF-8 BOM
+    // so editors/tools that sniff encoding by byte signature don't
+    // misdetect them. Rather than threading BOM-handling through every
+    // write site (and risking a double-prepended BOM on files that get
+    // read -> modified -> rewritten more than once during processing), do
+    // a single finishing pass over the final output once everything has
+    // settled.
+    const UTF8_BOM_EXTENSIONS = new Set(['.html', '.htm', '.css', '.js']);
+    const UTF8_BOM_BYTES = Buffer.from([0xEF, 0xBB, 0xBF]);
+
+    function addUtf8Bom(dir) {
+        if (!fs.existsSync(dir)) return;
+        const entries = fs.readdirSync(dir);
+
+        for (const entry of entries) {
+            const filePath = path.join(dir, entry);
+            const stat = fs.statSync(filePath);
+
+            if (stat.isDirectory()) {
+                addUtf8Bom(filePath);
+                continue;
+            }
+
+            if (!UTF8_BOM_EXTENSIONS.has(path.extname(filePath).toLowerCase())) continue;
+
+            try {
+                const buffer = fs.readFileSync(filePath);
+                const alreadyHasBom =
+                    buffer.length >= 3 && buffer.subarray(0, 3).equals(UTF8_BOM_BYTES);
+
+                if (!alreadyHasBom && buffer.length > 0) {
+                    fs.writeFileSync(filePath, Buffer.concat([UTF8_BOM_BYTES, buffer]));
+                }
+            } catch (e) {
+                log.error(`Failed to add UTF-8 BOM to ${filePath}: ${e.message}`);
+            }
+        }
+    }
+
+    addUtf8Bom(OUTPUT_DIR);
     removeEmptyFiles(OUTPUT_DIR);
 
     writeErrorLog();
