@@ -87,7 +87,8 @@ const __dirname = dirname(__filename);
         "replace": "{replace}"
     }],
     "absolutizeRootRelativeLinks": true,
-    "beautifyHtml": true
+    "beautifyHtml": true,
+    "deleteUnusedFiles": false
 }
 */
 
@@ -208,6 +209,13 @@ let REPLACES_JS = [];
 let REPLACES_CSS = [];
 let REPLACES_HTML = [];
 let BEAUTIFY_HTML = false;
+
+// When true, any file written to OUTPUT_DIR that never ends up referenced
+// by the final index.html / saved CSS / saved JS (e.g. JS bundles that were
+// fetched by the page but then stripped out via removeAllScripts/excludeScripts,
+// or XHR/fetch JSON responses that were downloaded but never linked anywhere
+// in the static output) gets deleted at the end of the run.
+let DELETE_UNUSED_FILES = false;
 
 const flatPathRegistry = new Map();
 
@@ -1240,8 +1248,9 @@ function applyConfigData(data) {
     if (data.replacesCss && Array.isArray(data.replacesCss)) REPLACES_CSS = data.replacesCss;
     if (data.replacesHtml && Array.isArray(data.replacesHtml)) REPLACES_HTML = data.replacesHtml;
     if (typeof data.beautifyHtml === 'boolean') BEAUTIFY_HTML = data.beautifyHtml;
+    if (typeof data.deleteUnusedFiles === 'boolean') DELETE_UNUSED_FILES = data.deleteUnusedFiles;
 
-    log.info(`[Config Loaded] Evaluate HTML: ${EVALUATE_HTML}, Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Use Script Blocker: ${USER_SCRIPT_BLOCKER}, Combine Styles: ${COMBINE_ALL_STYLES}, Shadow Roots: ${USE_SHADOW_ROOTS}, Rewrite JS Asset URLs: ${REWRITE_JS_ASSET_URLS}, Absolutize Root-Relative Links: ${ABSOLUTIZE_ROOT_RELATIVE_LINKS}, Wait Time: ${WAIT_FOR_DYNAMIC_CONTENT}ms, Replaces: ${ENABLE_REPLACES ? `on (js:${REPLACES_JS.length} css:${REPLACES_CSS.length} html:${REPLACES_HTML.length})` : 'off'}, Absolutize root relative links: ${ABSOLUTIZE_ROOT_RELATIVE_LINKS}, Beautify HTML: ${BEAUTIFY_HTML}`);
+    log.info(`[Config Loaded] Evaluate HTML: ${EVALUATE_HTML}, Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Use Script Blocker: ${USER_SCRIPT_BLOCKER}, Combine Styles: ${COMBINE_ALL_STYLES}, Shadow Roots: ${USE_SHADOW_ROOTS}, Rewrite JS Asset URLs: ${REWRITE_JS_ASSET_URLS}, Absolutize Root-Relative Links: ${ABSOLUTIZE_ROOT_RELATIVE_LINKS}, Wait Time: ${WAIT_FOR_DYNAMIC_CONTENT}ms, Replaces: ${ENABLE_REPLACES ? `on (js:${REPLACES_JS.length} css:${REPLACES_CSS.length} html:${REPLACES_HTML.length})` : 'off'}, Absolutize root relative links: ${ABSOLUTIZE_ROOT_RELATIVE_LINKS}, Beautify HTML: ${BEAUTIFY_HTML}, Delete Unused Files: ${DELETE_UNUSED_FILES}`);
 }
 
 async function loadConfig() {
@@ -2320,6 +2329,74 @@ async function downloadPage() {
 
 
     
+    // Deletes any file under `dir` that was written to disk during the
+    // download but never ended up referenced anywhere in the final output
+    // (index.html, saved/rewritten CSS, saved/rewritten JS). This happens
+    // when a resource is fetched by the live page - and therefore captured
+    // by the response listener - but the tag/reference that pulled it in
+    // gets stripped afterwards (removeAllScripts, excludeScripts) or was
+    // never a static reference to begin with (analytics/XHR/fetch JSON
+    // that isn't linked from markup, CSS, or a saved JS file).
+    //
+    // "Used" is determined from assetPathRegistry, which is the single
+    // place every rewritten HTML/CSS/JS reference gets its local path from
+    // (see getOrCreateAssetPath) - so it's an accurate map of what the
+    // final output actually points at.
+    function removeUnusedFiles(dir) {
+        const keepPaths = new Set();
+        keepPaths.add(path.resolve(rootHtmlPath));
+
+        for (const relativePath of assetPathRegistry.values()) {
+            keepPaths.add(path.resolve(path.join(OUTPUT_DIR, relativePath)));
+        }
+
+        // Saved CSS/JS files are only added to assetPathRegistry if the tag
+        // that referenced them (link/script) survived into the final HTML.
+        // If REMOVE_ALL_SCRIPTS or excludeScripts stripped that tag, the
+        // saved file is orphaned and should be treated as unused too - which
+        // falls out naturally since we don't add savedCssFiles/savedJsFiles
+        // here directly, only what's actually still referenced.
+
+        let deletedCount = 0;
+
+        function walk(currentDir) {
+            if (!fs.existsSync(currentDir)) return;
+            const entries = fs.readdirSync(currentDir);
+
+            for (const entry of entries) {
+                const entryPath = path.join(currentDir, entry);
+                let stat;
+                try {
+                    stat = fs.statSync(entryPath);
+                } catch (e) {
+                    continue;
+                }
+
+                if (stat.isDirectory()) {
+                    walk(entryPath);
+                    // Prune the directory if it ended up empty after
+                    // deleting its unused contents.
+                    try {
+                        if (fs.readdirSync(entryPath).length === 0) {
+                            fs.rmdirSync(entryPath);
+                        }
+                    } catch (e) {}
+                } else if (!keepPaths.has(path.resolve(entryPath))) {
+                    log.warn(`Removing unused file: ${entryPath}`);
+                    try {
+                        fs.unlinkSync(entryPath);
+                        deletedCount++;
+                    } catch (e) {
+                        log.error(`Failed to remove unused file ${entryPath}: ${e.message}`);
+                    }
+                }
+            }
+        }
+
+        walk(dir);
+        log.info(`Removed ${deletedCount} unused file(s)`);
+    }
+
     function removeEmptyFiles(dir) {
         if (!fs.existsSync(dir)) return;
         const files = fs.readdirSync(dir);
@@ -2377,6 +2454,11 @@ async function downloadPage() {
                 log.error(`Failed to add UTF-8 BOM to ${filePath}: ${e.message}`);
             }
         }
+    }
+
+    if (DELETE_UNUSED_FILES) {
+        log.section("Removing unused files");
+        removeUnusedFiles(OUTPUT_DIR);
     }
 
     addUtf8Bom(OUTPUT_DIR);

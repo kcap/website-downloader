@@ -73,5 +73,6 @@
         "replace": "{replace}"
     }],
     "absolutizeRootRelativeLinks": true,
-    "beautifyHtml": true
+    "beautifyHtml": true,
+    "deleteUnusedFiles": true
 }
