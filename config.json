@@ -30,7 +30,14 @@
     "rewriteAssetUrlsInJs": false,
     "strippedAttributes": ["srcset", "integrity"],
     "disableStrippedAttributes": false,
-    "strippedTags": ["base", "iframe", "noscript", "*[id='exampleToStrip']", "*link[rel='preconnect']", "*link[rel='alternate']"],
+    "strippedTags": [
+        "base",
+        "iframe",
+        "noscript",
+        "link[rel='preconnect']",
+        "link[rel='alternate']",
+        "link[rel='manifest']"
+    ],
     "commentStrippedTags": false,
     "removeAllScripts": true,
     "combineAllStyles": false,
@@ -58,8 +65,10 @@
     "replacesJs": [],
     "replacesCss": [],
     "replacesHtml": [
-        { "find": "{find}", "replace": "{replace}" }
-    ],
-
+    {
+        "find": "{find}",
+        "replace": "{replace}"
+    }],
+    "absolutizeRootRelativeLinks": true,
     "beautifyHtml": true
 }

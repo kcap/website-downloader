@@ -217,7 +217,7 @@ function createDownloadStatus() {
         update(stats) {
             freshLine();
             term.eraseLineAfter();
-            term(' ')
+            term('')
                 .cyan('Downloading assets ')
                 .green(`ok:${stats.downloaded} `)
                 .yellow(`skip:${stats.skipped} `)

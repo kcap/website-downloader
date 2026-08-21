@@ -54,6 +54,38 @@ const MIME_TO_EXTENSION = {
     'application/vnd.ms-fontobject': '.eot'
 };
 
+// Extensions used to sniff whether a bare string (e.g. a <meta content="...">
+// value or an <a href="...">) actually points at a downloadable file, since
+// not every asset URL comes with a matching Content-Type at check time.
+const IMAGE_EXTENSIONS = new Set(
+    Object.entries(MIME_TO_EXTENSION)
+        .filter(([mime]) => mime.startsWith('image/'))
+        .map(([, ext]) => ext)
+);
+
+// Broader set of "this <a href> is really a file, not a page" extensions.
+// Feel free to extend this list for other file types you want <a> links
+// to download instead of leaving pointed at the live site.
+const ASSET_LINK_EXTENSIONS = new Set([
+    ...IMAGE_EXTENSIONS,
+    '.pdf', '.zip', '.rar', '.7z', '.gz', '.tar',
+    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.mp3', '.mp4', '.mov', '.avi', '.webm', '.ogg', '.wav', '.m4a',
+    '.woff', '.woff2', '.ttf', '.otf', '.eot',
+    '.txt', '.csv', '.json', '.xml'
+]);
+
+// Extracts a lowercased file extension from a URL/path, ignoring any
+// query string or hash fragment (".png?v=2" -> ".png").
+function getUrlExtension(urlStr) {
+    try {
+        const clean = urlStr.split('?')[0].split('#')[0];
+        return path.extname(clean).toLowerCase();
+    } catch (e) {
+        return '';
+    }
+}
+
 const HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': '*/*',
@@ -77,6 +109,7 @@ let COMMENT_STRIPPED_TAGS = false;
 let COMBINE_ALL_STYLES = false;
 let USE_SHADOW_ROOTS = false;
 let REWRITE_JS_ASSET_URLS = true;
+let ABSOLUTIZE_ROOT_RELATIVE_LINKS = false;
 let WAIT_FOR_DYNAMIC_CONTENT = 5000; // Default wait time in ms
 let ERROR_LOG_PATH = '';
 let EVALUATE_HTML = true;
@@ -1105,6 +1138,7 @@ function applyConfigData(data) {
     if (typeof data.combineAllStyles === 'boolean') COMBINE_ALL_STYLES = data.combineAllStyles;
     if (typeof data.useShadowRoots === 'boolean') USE_SHADOW_ROOTS = data.useShadowRoots;
     if (typeof data.rewriteAssetUrlsInJs === 'boolean') REWRITE_JS_ASSET_URLS = data.rewriteAssetUrlsInJs;
+    if (typeof data.absolutizeRootRelativeLinks === 'boolean') ABSOLUTIZE_ROOT_RELATIVE_LINKS = data.absolutizeRootRelativeLinks;
     if (data.waitForDynamicContent) {
         WAIT_FOR_DYNAMIC_CONTENT = data.waitForDynamicContent;
     }
@@ -1127,7 +1161,7 @@ function applyConfigData(data) {
     if (data.replacesHtml && Array.isArray(data.replacesHtml)) REPLACES_HTML = data.replacesHtml;
     if (typeof data.beautifyHtml === 'boolean') BEAUTIFY_HTML = data.beautifyHtml;
 
-    log.info(`[Config Loaded] Evaluate HTML: ${EVALUATE_HTML}, Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Use Script Blocker: ${USER_SCRIPT_BLOCKER}, Combine Styles: ${COMBINE_ALL_STYLES}, Shadow Roots: ${USE_SHADOW_ROOTS}, Rewrite JS Asset URLs: ${REWRITE_JS_ASSET_URLS}, Wait Time: ${WAIT_FOR_DYNAMIC_CONTENT}ms, Replaces: ${ENABLE_REPLACES ? `on (js:${REPLACES_JS.length} css:${REPLACES_CSS.length} html:${REPLACES_HTML.length})` : 'off'}, Beautify HTML: ${BEAUTIFY_HTML}`);
+    log.info(`[Config Loaded] Evaluate HTML: ${EVALUATE_HTML}, Flatten: ${FLATTEN_ASSETS}, Strip Scripts: ${REMOVE_ALL_SCRIPTS}, Use Script Blocker: ${USER_SCRIPT_BLOCKER}, Combine Styles: ${COMBINE_ALL_STYLES}, Shadow Roots: ${USE_SHADOW_ROOTS}, Rewrite JS Asset URLs: ${REWRITE_JS_ASSET_URLS}, Absolutize Root-Relative Links: ${ABSOLUTIZE_ROOT_RELATIVE_LINKS}, Wait Time: ${WAIT_FOR_DYNAMIC_CONTENT}ms, Replaces: ${ENABLE_REPLACES ? `on (js:${REPLACES_JS.length} css:${REPLACES_CSS.length} html:${REPLACES_HTML.length})` : 'off'}, Absolutize root relative links: ${ABSOLUTIZE_ROOT_RELATIVE_LINKS}, Beautify HTML: ${BEAUTIFY_HTML}`);
 }
 
 async function loadConfig() {
@@ -1961,7 +1995,15 @@ async function downloadPage() {
         $('body').append(scriptTag);
     }
 
+    // <meta content="..."> is used for all kinds of non-URL values too
+    // (viewport, description, theme-color, robots, ...), so we can't just
+    // treat every meta's content as a URL. Instead we match every meta
+    // with a content attribute here, then gate on file-extension below
+    // (only content values that look like an actual image file, e.g.
+    // og:image, twitter:image, msapplication tile icons, itemprop=image,
+    // get resolved/downloaded - everything else is left untouched).
     const resourcesToRewrite = [
+        { selector: 'meta[content]', attr: 'content' },
         { selector: '*[src]', attr: 'src' },
         { selector: '*[href]', attr: 'href' }
     ];
@@ -1973,8 +2015,43 @@ async function downloadPage() {
             const element = $(el);
             let originalValue = element.attr(attr);
             if (!originalValue || originalValue.startsWith('data:')) continue;
-            if (el.name === 'a') continue;
             if (attr === 'href' && (originalValue.startsWith('#') || originalValue.startsWith('javascript:'))) continue;
+            if (el.name === 'a' && (originalValue.startsWith('mailto:') || originalValue.startsWith('tel:'))) continue;
+
+            // <meta> and <a> attributes are frequently NOT asset URLs at all
+            // (viewport/description content, ordinary page-to-page links),
+            // so only treat them as downloadable assets when the value's
+            // file extension says it actually points at a file. Every other
+            // element (img, link, script, source, ...) already only ever
+            // puts real asset URLs in src/href, so no extension check is
+            // needed for those - only meta/a are special-cased here.
+            if (el.name === 'meta' || el.name === 'a') {
+                const ext = getUrlExtension(originalValue);
+                const allowed = el.name === 'meta' ? IMAGE_EXTENSIONS : ASSET_LINK_EXTENSIONS;
+                if (!allowed.has(ext)) {
+                    // Not a file - it's a normal page link (or non-image
+                    // meta), so we deliberately don't touch it or download
+                    // it. But a root-relative link like href="/page" is
+                    // meant to resolve against the ORIGINAL site's domain;
+                    // once the page is opened from a different host (e.g.
+                    // a local server, file://, or a different domain), it
+                    // silently resolves against that host instead and 404s.
+                    // When enabled, rewrite it to a full absolute URL
+                    // pointing back at the original domain so it still
+                    // works wherever the downloaded copy is served from.
+                    if (
+                        ABSOLUTIZE_ROOT_RELATIVE_LINKS &&
+                        el.name === 'a' &&
+                        originalValue.startsWith('/') &&
+                        !originalValue.startsWith('//')
+                    ) {
+                        try {
+                            element.attr(attr, new URL(originalValue, TARGET_URL).href);
+                        } catch (e) {}
+                    }
+                    continue;
+                }
+            }
 
             try {
                 const absoluteUrl = new URL(originalValue, TARGET_URL).href;
@@ -1991,7 +2068,7 @@ async function downloadPage() {
                 let assetLocalPath = urlToLocalPath(absoluteUrl, knownContentType);
                 let assetAvailable = !!assetLocalPath && fs.existsSync(assetLocalPath);
 
-                if (!assetAvailable && ['img', 'source', 'link', 'script'].includes(el.name)) {
+                if (!assetAvailable && ['img', 'source', 'link', 'script', 'meta', 'a'].includes(el.name)) {
                     const localPath = urlToLocalPath(absoluteUrl);
                     if (localPath) {
                         const result = await safeDownload(absoluteUrl, localPath);
